@@ -8,6 +8,8 @@ public static class ScsiInquiryReader
     // =========================
     // Constants
     // =========================
+    const uint GENERIC_READ  = 0x80000000;
+    const uint GENERIC_WRITE = 0x40000000;
     const int FILE_SHARE_READ = 1;
     const int FILE_SHARE_WRITE = 2;
     const int OPEN_EXISTING = 3;
@@ -24,11 +26,14 @@ public static class ScsiInquiryReader
         {
             foreach (ManagementObject drive in searcher.Get())
             {
-                string deviceId = drive["DeviceID"]?.ToString();
+                string pnpDeviceId = drive["PNPDeviceID"]?.ToString() ?? "";
 
-                if (!string.IsNullOrEmpty(deviceId))
+                if (pnpDeviceId.IndexOf($"VID_{vid}", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                    pnpDeviceId.IndexOf($"PID_{pid}", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    return deviceId; // Example: \\.\PHYSICALDRIVE2
+                    string deviceId = drive["DeviceID"]?.ToString();
+                    if (!string.IsNullOrEmpty(deviceId))
+                        return deviceId; // Example: \\.\PHYSICALDRIVE2
                 }
             }
         }
@@ -47,7 +52,7 @@ public static class ScsiInquiryReader
 
         IntPtr handle = CreateFile(
             physicalDrivePath,
-            0,
+            GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             IntPtr.Zero,
             OPEN_EXISTING,
@@ -91,8 +96,6 @@ public static class ScsiInquiryReader
             Console.WriteLine($"[SCSI] Revision: {revision}");
 
             return true;
-
-            return true;
         }
         finally
         {
@@ -107,7 +110,7 @@ public static class ScsiInquiryReader
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern IntPtr CreateFile(
         string lpFileName,
-        int dwDesiredAccess,
+        uint dwDesiredAccess,
         int dwShareMode,
         IntPtr lpSecurityAttributes,
         int dwCreationDisposition,

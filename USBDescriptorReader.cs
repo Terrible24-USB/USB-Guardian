@@ -30,7 +30,7 @@ namespace USBGuardian
 
             IntPtr handle = CreateFile(
                 physicalDrivePath,
-                0,
+                GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 IntPtr.Zero,
                 OPEN_EXISTING,
@@ -49,19 +49,31 @@ namespace USBGuardian
 
                 byte[] buffer = new byte[36];
 
-                [DllImport("kernel32.dll", SetLastError = true)]
-                static extern bool DeviceIoControl(
-    IntPtr hDevice,
-    uint dwIoControlCode,
-    IntPtr lpInBuffer,
-    int nInBufferSize,
-    IntPtr lpOutBuffer,
-    int nOutBufferSize,
-    out int lpBytesReturned,
-    IntPtr lpOverlapped);
+                GCHandle inHandle  = GCHandle.Alloc(inquiryCommand, GCHandleType.Pinned);
+                GCHandle outHandle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+                try
+                {
+                    bool result = DeviceIoControl(
+                        handle,
+                        IOCTL_SCSI_PASS_THROUGH_DIRECT,
+                        inHandle.AddrOfPinnedObject(),
+                        inquiryCommand.Length,
+                        outHandle.AddrOfPinnedObject(),
+                        buffer.Length,
+                        out int bytesReturned,
+                        IntPtr.Zero);
 
-                vendor = Encoding.ASCII.GetString(buffer, 8, 8).Trim();
-                product = Encoding.ASCII.GetString(buffer, 16, 16).Trim();
+                    if (!result)
+                        return false;
+                }
+                finally
+                {
+                    inHandle.Free();
+                    outHandle.Free();
+                }
+
+                vendor   = Encoding.ASCII.GetString(buffer, 8, 8).Trim();
+                product  = Encoding.ASCII.GetString(buffer, 16, 16).Trim();
                 revision = Encoding.ASCII.GetString(buffer, 32, 4).Trim();
 
                 return true;
@@ -182,6 +194,8 @@ namespace USBGuardian
             }
         }
 
+        private const uint GENERIC_READ  = 0x80000000;
+        private const uint GENERIC_WRITE = 0x40000000;
         private const int FILE_SHARE_READ = 0x00000001;
         private const int FILE_SHARE_WRITE = 0x00000002;
         private const int OPEN_EXISTING = 3;
