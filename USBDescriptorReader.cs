@@ -504,11 +504,16 @@ namespace USBGuardian
 
                     // 6. Read configuration descriptor
                     Debug.WriteLine("[USBDescriptorReader] Reading configuration descriptor...");
-                    if (!ReadConfigurationDescriptor(hHub, port, out List<USB_INTERFACE_DESCRIPTOR> interfaces,
-                                                     out List<USB_ENDPOINT_DESCRIPTOR> endpoints,
-                                                     out USB_CONFIGURATION_DESCRIPTOR configDesc))
+                    List<USB_INTERFACE_DESCRIPTOR> interfaces = null;
+                    List<USB_ENDPOINT_DESCRIPTOR> endpoints = null;
+                    USB_CONFIGURATION_DESCRIPTOR configDesc = default;
+                    if (!ReadConfigurationDescriptor(hHub, port, out interfaces,
+                                                     out endpoints,
+                                                     out configDesc))
                     {
                         Debug.WriteLine("[USBDescriptorReader] Failed to read configuration descriptor");
+                        interfaces = new List<USB_INTERFACE_DESCRIPTOR>();
+                        endpoints  = new List<USB_ENDPOINT_DESCRIPTOR>();
                     }
                     else
                     {
@@ -517,8 +522,44 @@ namespace USBGuardian
                         fingerprint.MaxPower = configDesc.MaxPower;
                         Debug.WriteLine($"[USBDescriptorReader] Config: {configDesc.bNumInterfaces} interfaces, {endpoints.Count} endpoints");
 
+                        // ===== INTERFACE HASH — log what's being hashed =====
+                        Debug.WriteLine("[USBDescriptorReader] === COMPUTING INTERFACE HASH ===");
+                        for (int idx = 0; idx < interfaces.Count; idx++)
+                        {
+                            var iface = interfaces[idx];
+                            string label = HIDClassifier.ClassifyInterface(iface.bInterfaceClass, iface.bInterfaceSubClass, iface.bInterfaceProtocol) ?? "Unknown";
+                            Debug.WriteLine($"[USBDescriptorReader] Interface[{idx}]: " +
+                                            $"Class=0x{iface.bInterfaceClass:X2} ({HIDClassifier.GetClassName(iface.bInterfaceClass)}), " +
+                                            $"SubClass=0x{iface.bInterfaceSubClass:X2} ({HIDClassifier.GetSubClassName(iface.bInterfaceClass, iface.bInterfaceSubClass)}), " +
+                                            $"Protocol=0x{iface.bInterfaceProtocol:X2} ({HIDClassifier.GetProtocolName(iface.bInterfaceClass, iface.bInterfaceSubClass, iface.bInterfaceProtocol)}) " +
+                                            $"→ {label}");
+                        }
+                        Debug.WriteLine("[USBDescriptorReader] Computing SHA256 on interface descriptors...");
                         fingerprint.InterfaceDescriptorHash = ComputeDescriptorHash(interfaces);
+                        Debug.WriteLine($"[USBDescriptorReader] Interface Hash: {fingerprint.InterfaceDescriptorHash}");
+
+                        // ===== ENDPOINT HASH — log what's being hashed =====
+                        Debug.WriteLine("[USBDescriptorReader] === COMPUTING ENDPOINT HASH ===");
+                        for (int idx = 0; idx < endpoints.Count; idx++)
+                        {
+                            var ep = endpoints[idx];
+                            string epType = (ep.bmAttributes & 0x03) switch
+                            {
+                                0x00 => "Control",
+                                0x01 => "Isochronous",
+                                0x02 => "Bulk",
+                                0x03 => "Interrupt",
+                                _    => $"0x{ep.bmAttributes:X2}"
+                            };
+                            Debug.WriteLine($"[USBDescriptorReader] Endpoint[{idx}]: " +
+                                            $"Addr=0x{ep.bEndpointAddress:X2}, " +
+                                            $"Type={epType}, " +
+                                            $"MaxPacket={ep.wMaxPacketSize}, " +
+                                            $"Interval={ep.bInterval}");
+                        }
+                        Debug.WriteLine("[USBDescriptorReader] Computing SHA256 on endpoint descriptors...");
                         fingerprint.EndpointDescriptorHash = ComputeDescriptorHash(endpoints);
+                        Debug.WriteLine($"[USBDescriptorReader] Endpoint Hash: {fingerprint.EndpointDescriptorHash}");
 
                         // Populate per-interface class info
                         if (interfaces.Count > 0)
@@ -528,14 +569,12 @@ namespace USBGuardian
                             fingerprint.InterfaceSubClass = interfaces[0].bInterfaceSubClass;
                             fingerprint.InterfaceProtocol = interfaces[0].bInterfaceProtocol;
 
-                            Debug.WriteLine($"[USBDescriptorReader] Interface[0] Class: 0x{interfaces[0].bInterfaceClass:X2}, " +
-                                            $"SubClass: 0x{interfaces[0].bInterfaceSubClass:X2}, " +
-                                            $"Protocol: 0x{interfaces[0].bInterfaceProtocol:X2}");
-
-                            // Populate full list for multi-interface composite devices
+                            // Populate full list for multi-interface composite devices,
+                            // including the interface number from the USB descriptor.
                             fingerprint.AllInterfaces = interfaces
                                 .Select(i => new HIDClassifier.InterfaceInfo
                                 {
+                                    InterfaceNumber   = i.bInterfaceNumber,
                                     InterfaceClass    = i.bInterfaceClass,
                                     InterfaceSubClass = i.bInterfaceSubClass,
                                     InterfaceProtocol = i.bInterfaceProtocol
@@ -545,25 +584,66 @@ namespace USBGuardian
                     }
 
                     // ===== Read BOS Descriptor =====
+                    Debug.WriteLine("[USBDescriptorReader] === COMPUTING BOS HASH ===");
                     Debug.WriteLine("[USBDescriptorReader] Reading BOS descriptor...");
 
                     byte[] bos = ReadBosDescriptor(hHub, port);
 
                     if (bos != null)
                     {
+                        Debug.WriteLine($"[USBDescriptorReader] BOS Data: {bos.Length} bytes, DescType=0x{(bos.Length > 1 ? bos[1] : 0):X2}");
+                        if (bos.Length >= 5)
+                        {
+                            byte numCaps = bos[4];
+                            Debug.WriteLine($"[USBDescriptorReader] BOS NumDeviceCaps={numCaps}");
+                        }
+                        Debug.WriteLine("[USBDescriptorReader] Computing SHA256 on BOS data...");
                         string bosHash = ComputeBosHash(bos);
                         fingerprint.BosHash = bosHash;
-
                         Debug.WriteLine($"[USBDescriptorReader] BOS Hash: {bosHash}");
                     }
                     else
                     {
-                        Debug.WriteLine("[USBDescriptorReader] No BOS descriptor available.");
+                        Debug.WriteLine("[USBDescriptorReader] No BOS descriptor available (USB 2.0 device or read failed).");
                     }
 
-                    // 7. Compute final descriptor hash
+                    // 7. Compute final descriptor hash — log all inputs
+                    Debug.WriteLine("[USBDescriptorReader] === COMPUTING DESCRIPTOR HASH ===");
+                    Debug.WriteLine($"[USBDescriptorReader] Device: bcdUSB=0x{devDesc.bcdUSB:X4}, " +
+                                    $"Class=0x{devDesc.bDeviceClass:X2}, " +
+                                    $"SubClass=0x{devDesc.bDeviceSubClass:X2}, " +
+                                    $"Protocol=0x{devDesc.bDeviceProtocol:X2}");
+                    Debug.WriteLine($"[USBDescriptorReader] Config: Attributes=0x{configDesc.bmAttributes:X2}, " +
+                                    $"MaxPower={(configDesc.MaxPower * 2)}mA, " +
+                                    $"NumInterfaces={configDesc.bNumInterfaces}");
+                    for (int idx = 0; idx < interfaces.Count; idx++)
+                    {
+                        var iface = interfaces[idx];
+                        string label = HIDClassifier.ClassifyInterface(iface.bInterfaceClass, iface.bInterfaceSubClass, iface.bInterfaceProtocol) ?? "Unknown";
+                        Debug.WriteLine($"[USBDescriptorReader] Interface[{idx}]: " +
+                                        $"Class=0x{iface.bInterfaceClass:X2}, " +
+                                        $"SubClass=0x{iface.bInterfaceSubClass:X2}, " +
+                                        $"Protocol=0x{iface.bInterfaceProtocol:X2} ({label})");
+                    }
+                    for (int idx = 0; idx < endpoints.Count; idx++)
+                    {
+                        var ep = endpoints[idx];
+                        string epType = (ep.bmAttributes & 0x03) switch
+                        {
+                            0x00 => "Control",
+                            0x01 => "Isochronous",
+                            0x02 => "Bulk",
+                            0x03 => "Interrupt",
+                            _    => $"0x{ep.bmAttributes:X2}"
+                        };
+                        Debug.WriteLine($"[USBDescriptorReader] Endpoint[{idx}]: " +
+                                        $"Addr=0x{ep.bEndpointAddress:X2}, " +
+                                        $"Type={epType}, " +
+                                        $"MaxPacket={ep.wMaxPacketSize}");
+                    }
+                    Debug.WriteLine("[USBDescriptorReader] Computing SHA256 on combined data...");
                     fingerprint.DescriptorHash = ComputeFullDescriptorHash(devDesc, configDesc, interfaces, endpoints);
-                    Debug.WriteLine("[USBDescriptorReader] Descriptor hash computed successfully.");
+                    Debug.WriteLine($"[USBDescriptorReader] Final Descriptor Hash: {fingerprint.DescriptorHash}");
 
                     return true;
                 }
