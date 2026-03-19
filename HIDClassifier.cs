@@ -51,6 +51,7 @@ namespace USBGuardian
         /// </summary>
         public class InterfaceInfo
         {
+            public byte InterfaceNumber { get; set; }   // bInterfaceNumber from USB descriptor
             public byte InterfaceClass { get; set; }
             public byte InterfaceSubClass { get; set; }
             public byte InterfaceProtocol { get; set; }

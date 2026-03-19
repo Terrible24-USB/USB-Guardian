@@ -744,6 +744,23 @@ namespace USBGuardian
                     fingerprint.DescriptorHash = GenerateFallbackDescriptorHash(fingerprint);
                 }
 
+                // Derive interface numbers from USB descriptor (more accurate than device path)
+                if (fingerprint.AllInterfaces != null && fingerprint.AllInterfaces.Count > 0)
+                {
+                    var nums = fingerprint.AllInterfaces
+                        .Select(i => i.InterfaceNumber.ToString())
+                        .Distinct()
+                        .OrderBy(n => n);
+                    fingerprint.InterfaceNumbers = string.Join(", ", nums);
+                }
+                else if (fingerprint.InterfaceNumber != null)
+                {
+                    fingerprint.InterfaceNumbers = fingerprint.InterfaceNumber;
+                }
+
+                // ===== EXTENDED DEVICE INFO =====
+                CaptureExtendedDeviceInfo(fingerprint);
+
                 // ===== HID DEVICE CLASSIFICATION =====
                 // Classify device types using interface descriptors (populated by USBDescriptorReader)
                 if (fingerprint.AllInterfaces != null && fingerprint.AllInterfaces.Count > 0)
@@ -802,6 +819,139 @@ namespace USBGuardian
                 }
             }
 
+            /// <summary>
+            /// Reads extended device information from the registry and WMI:
+            /// friendly name, driver version, bus type, location, capabilities, storage size, etc.
+            /// </summary>
+            private void CaptureExtendedDeviceInfo(DeviceFingerprint fingerprint)
+            {
+                try
+                {
+                    string regPath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{fingerprint.Vid}&PID_{fingerprint.Pid}\{fingerprint.InstanceId}";
+                    using (RegistryKey key = Registry.LocalMachine.OpenSubKey(regPath))
+                    {
+                        if (key != null)
+                        {
+                            fingerprint.FriendlyName  = key.GetValue("FriendlyName")?.ToString();
+                            fingerprint.ClassGuid      = key.GetValue("ClassGUID")?.ToString();
+                            fingerprint.DriverKeyName  = key.GetValue("Driver")?.ToString();
+                            fingerprint.LocationInfo   = key.GetValue("LocationInformation")?.ToString();
+                            fingerprint.Enumerator     = key.GetValue("EnumeratorName")?.ToString();
+
+                            object addrObj = key.GetValue("Address");
+                            if (addrObj != null)
+                                fingerprint.Address = addrObj.ToString();
+
+                            object capsObj = key.GetValue("Capabilities");
+                            if (capsObj is int caps)
+                                fingerprint.Capabilities = (uint)caps;
+
+                            // Full device instance ID for the child (e.g. USBSTOR\...)
+                            // Read from the child device if available; otherwise use the USB-level key
+                            fingerprint.DeviceId = $@"USB\VID_{fingerprint.Vid}&PID_{fingerprint.Pid}\{fingerprint.InstanceId}";
+                        }
+                    }
+
+                    // Driver info from the class registry key
+                    if (!string.IsNullOrEmpty(fingerprint.DriverKeyName))
+                    {
+                        string driverPath = $@"SYSTEM\CurrentControlSet\Control\Class\{fingerprint.DriverKeyName}";
+                        using (RegistryKey driverKey = Registry.LocalMachine.OpenSubKey(driverPath))
+                        {
+                            if (driverKey != null)
+                            {
+                                fingerprint.DriverName    = driverKey.GetValue("DriverDesc")?.ToString();
+                                fingerprint.DriverVersion = driverKey.GetValue("DriverVersion")?.ToString();
+                                fingerprint.DriverDate    = driverKey.GetValue("DriverDate")?.ToString();
+
+                                string infPath = driverKey.GetValue("InfPath")?.ToString();
+                                if (!string.IsNullOrEmpty(infPath) && string.IsNullOrEmpty(fingerprint.KernelName))
+                                    fingerprint.KernelName = infPath;
+                            }
+                        }
+                    }
+
+                    // Win32 name and storage size via WMI (storage devices)
+                    if (fingerprint.DeviceClass?.Contains("Storage") == true ||
+                        fingerprint.Service?.Equals("usbstor", StringComparison.OrdinalIgnoreCase) == true ||
+                        fingerprint.Service?.Equals("disk", StringComparison.OrdinalIgnoreCase) == true)
+                    {
+                        try
+                        {
+                            using (var searcher = new ManagementObjectSearcher(
+                                "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'"))
+                            {
+                                foreach (ManagementObject disk in searcher.Get())
+                                {
+                                    string pnpDeviceId = SafeGetString(disk, "PNPDeviceID");
+                                    if (!string.IsNullOrEmpty(pnpDeviceId) &&
+                                        pnpDeviceId.IndexOf($"VID_{fingerprint.Vid}&PID_{fingerprint.Pid}", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    {
+                                        fingerprint.Win32Name = SafeGetString(disk, "DeviceID");
+
+                                        object sizeObj = disk["Size"];
+                                        if (sizeObj != null && long.TryParse(sizeObj.ToString(), out long sz))
+                                            fingerprint.StorageTotalBytes = sz;
+
+                                        // Kernel name from PNP device ID e.g. USBSTOR\DISK -> disk.sys
+                                        string caption = SafeGetString(disk, "Caption");
+                                        if (!string.IsNullOrEmpty(fingerprint.Service) && string.IsNullOrEmpty(fingerprint.KernelName))
+                                            fingerprint.KernelName = fingerprint.Service + ".sys";
+
+                                        // Full device ID for storage child (USBSTOR\DISK&VEN_...)
+                                        if (!string.IsNullOrEmpty(pnpDeviceId))
+                                            fingerprint.DeviceId = pnpDeviceId;
+
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"[CaptureExtendedDeviceInfo] WMI disk error: {ex.Message}");
+                        }
+                    }
+                    else if (!string.IsNullOrEmpty(fingerprint.Service) && string.IsNullOrEmpty(fingerprint.KernelName))
+                    {
+                        fingerprint.KernelName = fingerprint.Service + ".sys";
+                    }
+
+                    // Power state: default to D0 (active – device just inserted)
+                    fingerprint.PowerState = "D0";
+
+                    // Enhanced power management flag from registry properties
+                    try
+                    {
+                        string propPath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{fingerprint.Vid}&PID_{fingerprint.Pid}\{fingerprint.InstanceId}\Device Parameters";
+                        using (RegistryKey propKey = Registry.LocalMachine.OpenSubKey(propPath))
+                        {
+                            if (propKey != null)
+                            {
+                                object epm = propKey.GetValue("EnhancedPowerManagementEnabled");
+                                fingerprint.EnhancedPowerManagementEnabled = epm is int i && i != 0;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[CaptureExtendedDeviceInfo] EPM registry error: {ex.Message}");
+                    }
+
+                    // Bus type string
+                    if (!string.IsNullOrEmpty(fingerprint.Service))
+                    {
+                        fingerprint.BusType = fingerprint.Service.Equals("usbstor", StringComparison.OrdinalIgnoreCase)
+                            ? "USB (USBSTOR)"
+                            : "USB";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[CaptureExtendedDeviceInfo] Error: {ex.Message}");
+                }
+            }
+
             private string GenerateHash(List<string> values)
             {
                 if (values == null || values.Count == 0)
@@ -843,6 +993,7 @@ namespace USBGuardian
                     Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
                     Console.ResetColor();
 
+                    // ── BASIC INFORMATION ──────────────────────────────────────
                     Console.WriteLine($"║ 📋 BASIC INFORMATION                                                        ║");
                     Console.WriteLine($"║   VID:................ {PadRight(fingerprint.Vid ?? "N/A", 40)} ║");
                     Console.WriteLine($"║   PID:................ {PadRight(fingerprint.Pid ?? "N/A", 40)} ║");
@@ -850,12 +1001,12 @@ namespace USBGuardian
                     Console.WriteLine($"║   Device Class (str):. {PadRight(fingerprint.DeviceClass ?? "N/A", 40)} ║");
                     Console.WriteLine($"║   Service:............ {PadRight(fingerprint.Service ?? "N/A", 40)} ║");
 
+                    // ── PRIMARY IDENTIFIERS ────────────────────────────────────
                     Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
                     Console.WriteLine($"║ 🔑 PRIMARY IDENTIFIERS                                                     ║");
 
-                    // Serial Number
                     string serialDisplay = !string.IsNullOrEmpty(fingerprint.SerialNumber)
-                        ? $"✅ {TruncateString(fingerprint.SerialNumber, 38)}"
+                        ? $"✅ {TruncateString(fingerprint.SerialNumber, 37)}"
                         : "❌ Not Available";
                     ConsoleColor serialColor = !string.IsNullOrEmpty(fingerprint.SerialNumber) ? ConsoleColor.Green : ConsoleColor.Red;
                     Console.Write($"║   Serial Number:...... ");
@@ -864,9 +1015,8 @@ namespace USBGuardian
                     Console.ResetColor();
                     Console.WriteLine(" ║");
 
-                    // Container ID
                     string containerDisplay = !string.IsNullOrEmpty(fingerprint.ContainerId)
-                        ? $"✅ {TruncateString(fingerprint.ContainerId, 38)}"
+                        ? $"✅ {TruncateString(fingerprint.ContainerId, 37)}"
                         : "❌ Not Available";
                     ConsoleColor containerColor = !string.IsNullOrEmpty(fingerprint.ContainerId) ? ConsoleColor.Green : ConsoleColor.Red;
                     Console.Write($"║   Container ID:....... ");
@@ -875,9 +1025,8 @@ namespace USBGuardian
                     Console.ResetColor();
                     Console.WriteLine(" ║");
 
-                    // Parent ID Prefix
                     string parentDisplay = !string.IsNullOrEmpty(fingerprint.ParentIdPrefix)
-                        ? $"✅ {TruncateString(fingerprint.ParentIdPrefix, 38)}"
+                        ? $"✅ {TruncateString(fingerprint.ParentIdPrefix, 37)}"
                         : "❌ Not Available";
                     ConsoleColor parentColor = !string.IsNullOrEmpty(fingerprint.ParentIdPrefix) ? ConsoleColor.Green : ConsoleColor.Red;
                     Console.Write($"║   Parent ID Prefix:... ");
@@ -886,105 +1035,157 @@ namespace USBGuardian
                     Console.ResetColor();
                     Console.WriteLine(" ║");
 
+                    // ── DEVICE INFORMATION ────────────────────────────────────
                     Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
-                    Console.WriteLine($"║ 📝 DEVICE INFORMATION                                                      ║");
+                    Console.WriteLine($"║ 🖥️  DEVICE INFORMATION                                                      ║");
                     Console.WriteLine($"║   Description:........ {PadRight(TruncateString(fingerprint.Description ?? "N/A", 40), 40)} ║");
                     Console.WriteLine($"║   Manufacturer:....... {PadRight(TruncateString(fingerprint.Manufacturer ?? "N/A", 40), 40)} ║");
-                    Console.WriteLine($"║   Interface Number:... {PadRight(fingerprint.InterfaceNumber ?? "N/A", 40)} ║");
-                    Console.WriteLine($"║   Interface Count:.... {PadRight(fingerprint.InterfaceCount.ToString(), 40)} ║");
-                    Console.WriteLine($"║   HWID Hash:.......... {PadRight(fingerprint.HardwareIdHash ?? "N/A", 40)} ║");
-                    Console.WriteLine($"║   Compatible Hash:.... {PadRight(fingerprint.CompatibleIdHash ?? "N/A", 40)} ║");
+                    if (!string.IsNullOrEmpty(fingerprint.FriendlyName))
+                        Console.WriteLine($"║   Friendly Name:...... {PadRight(TruncateString(fingerprint.FriendlyName, 40), 40)} ║");
+                    Console.WriteLine($"║   Device Path:........ {PadRight(TruncateString(fingerprint.DevicePath ?? "N/A", 40), 40)} ║");
+                    if (!string.IsNullOrEmpty(fingerprint.Win32Name))
+                        Console.WriteLine($"║   Win32 Name:......... {PadRight(TruncateString(fingerprint.Win32Name, 40), 40)} ║");
+                    if (!string.IsNullOrEmpty(fingerprint.KernelName))
+                        Console.WriteLine($"║   Kernel Module:...... {PadRight(TruncateString(fingerprint.KernelName, 40), 40)} ║");
+                    if (!string.IsNullOrEmpty(fingerprint.DeviceId))
+                        Console.WriteLine($"║   Device ID:.......... {PadRight(TruncateString(fingerprint.DeviceId, 40), 40)} ║");
+                    if (!string.IsNullOrEmpty(fingerprint.ClassGuid))
+                        Console.WriteLine($"║   Class GUID:......... {PadRight(TruncateString(fingerprint.ClassGuid, 40), 40)} ║");
+                    if (!string.IsNullOrEmpty(fingerprint.DriverName))
+                        Console.WriteLine($"║   Driver Name:........ {PadRight(TruncateString(fingerprint.DriverName, 40), 40)} ║");
+                    if (!string.IsNullOrEmpty(fingerprint.DriverVersion))
+                    {
+                        string driverInfo = fingerprint.DriverVersion +
+                            (!string.IsNullOrEmpty(fingerprint.DriverDate) ? $" ({fingerprint.DriverDate})" : "");
+                        Console.WriteLine($"║   Driver Version:..... {PadRight(TruncateString(driverInfo, 40), 40)} ║");
+                    }
+                    if (!string.IsNullOrEmpty(fingerprint.BusType))
+                        Console.WriteLine($"║   Bus Type:........... {PadRight(TruncateString(fingerprint.BusType, 40), 40)} ║");
+                    if (!string.IsNullOrEmpty(fingerprint.LocationInfo))
+                        Console.WriteLine($"║   Location Info:...... {PadRight(TruncateString(fingerprint.LocationInfo, 40), 40)} ║");
+                    if (!string.IsNullOrEmpty(fingerprint.Address))
+                        Console.WriteLine($"║   Address:............ {PadRight(fingerprint.Address, 40)} ║");
+                    Console.WriteLine($"║   Service:............ {PadRight(fingerprint.Service ?? "N/A", 40)} ║");
+                    if (!string.IsNullOrEmpty(fingerprint.Enumerator))
+                        Console.WriteLine($"║   Enumerator:......... {PadRight(fingerprint.Enumerator, 40)} ║");
+                    if (fingerprint.Capabilities != 0)
+                    {
+                        string capsStr = $"0x{fingerprint.Capabilities:X2} ({DecodeCapabilities(fingerprint.Capabilities)})";
+                        Console.WriteLine($"║   Capabilities:....... {PadRight(TruncateString(capsStr, 40), 40)} ║");
+                    }
+                    if (!string.IsNullOrEmpty(fingerprint.PowerState))
+                        Console.WriteLine($"║   Power State:........ {PadRight(GetPowerStateDescription(fingerprint.PowerState), 40)} ║");
+                    if (fingerprint.StorageTotalBytes > 0)
+                    {
+                        string sizeStr = FormatStorageSize(fingerprint.StorageTotalBytes);
+                        Console.WriteLine($"║   Size:............... {PadRight(TruncateString(sizeStr, 40), 40)} ║");
+                    }
 
+                    string firstTimeStr = fingerprint.FirstInstallTime != DateTime.MinValue
+                        ? fingerprint.FirstInstallTime.ToString("yyyy-MM-dd HH:mm:ss")
+                        : "N/A";
+                    string lastTimeStr = fingerprint.LastConnectedTime != DateTime.MinValue
+                        ? fingerprint.LastConnectedTime.ToString("yyyy-MM-dd HH:mm:ss")
+                        : "N/A";
+                    Console.WriteLine($"║   First Install Date:. {PadRight(firstTimeStr, 40)} ║");
+                    Console.WriteLine($"║   Last Arrival Date:.. {PadRight(lastTimeStr, 40)} ║");
+                    Console.WriteLine($"║   Enhanced Power Mgmt: {PadRight(fingerprint.EnhancedPowerManagementEnabled ? "Enabled" : "Disabled", 40)} ║");
+
+                    // ── USB DESCRIPTORS ───────────────────────────────────────
                     Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
                     Console.WriteLine($"║ 🔌 USB DESCRIPTORS                                                          ║");
-                    Console.WriteLine($"║   USB Device Class:... 0x{fingerprint.UsbDeviceClass:X2} ({fingerprint.UsbDeviceClass})           ║");
-                    Console.WriteLine($"║   USB SubClass:....... 0x{fingerprint.UsbDeviceSubClass:X2}              ║");
-                    Console.WriteLine($"║   USB Protocol:....... 0x{fingerprint.UsbDeviceProtocol:X2}              ║");
                     {
+                        string usbClassDesc = fingerprint.UsbDeviceClass == 0x00
+                            ? "Generic/Composite - see interfaces"
+                            : fingerprint.UsbDeviceClass.ToString();
+                        Console.WriteLine($"║   USB Device Class:... 0x{fingerprint.UsbDeviceClass:X2} ({PadRight(usbClassDesc, 30)}) ║");
+                        Console.WriteLine($"║   USB SubClass:....... 0x{fingerprint.UsbDeviceSubClass:X2}                                       ║");
+                        Console.WriteLine($"║   USB Protocol:....... 0x{fingerprint.UsbDeviceProtocol:X2}                                       ║");
+
                         string ifClassName  = HIDClassifier.GetClassName(fingerprint.InterfaceClass);
                         string ifSubCls     = HIDClassifier.GetSubClassName(fingerprint.InterfaceClass, fingerprint.InterfaceSubClass);
                         string ifProto      = HIDClassifier.GetProtocolName(fingerprint.InterfaceClass, fingerprint.InterfaceSubClass, fingerprint.InterfaceProtocol);
-                        Console.WriteLine($"║   Interface Class:.... 0x{fingerprint.InterfaceClass:X2} ({PadRight(ifClassName, 29)}) ║");
-                        Console.WriteLine($"║   Interface SubClass:. 0x{fingerprint.InterfaceSubClass:X2} ({PadRight(ifSubCls, 29)}) ║");
-                        Console.WriteLine($"║   Interface Protocol:. 0x{fingerprint.InterfaceProtocol:X2} ({PadRight(ifProto, 29)}) ║");
+                        Console.WriteLine($"║   Interface Class:.... 0x{fingerprint.InterfaceClass:X2} ({PadRight(ifClassName, 30)}) ║");
+                        Console.WriteLine($"║   Interface SubClass:. 0x{fingerprint.InterfaceSubClass:X2} ({PadRight(ifSubCls, 30)}) ║");
+                        Console.WriteLine($"║   Interface Protocol:. 0x{fingerprint.InterfaceProtocol:X2} ({PadRight(ifProto, 30)}) ║");
                     }
-                    Console.WriteLine($"║   Max Packet Size 0:... {fingerprint.MaxPacketSize0}                      ║");
-                    Console.WriteLine($"║   bcdUSB:.............. 0x{fingerprint.BcdUSB:X4}                         ║");
-                    Console.WriteLine($"║   bcdDevice:........... 0x{fingerprint.BcdDevice:X4}                      ║");
-                    Console.WriteLine($"║   Num Configurations:.. {fingerprint.NumConfigurations}                   ║");
-                    Console.WriteLine($"║   Num Interfaces:...... {fingerprint.NumInterfaces}                        ║");
-                    Console.WriteLine($"║   Config Attributes:... 0x{fingerprint.ConfigurationAttributes:X2}        ║");
-                    Console.WriteLine($"║   Max Power (mA):...... {fingerprint.MaxPower * 2}                        ║");
-                    Console.WriteLine($"║   Interface Hash:...... {PadRight(fingerprint.InterfaceDescriptorHash ?? "N/A", 40)} ║");
-                    Console.WriteLine($"║   Endpoint Hash:....... {PadRight(fingerprint.EndpointDescriptorHash ?? "N/A", 40)} ║");
-                    Console.WriteLine($"║   Descriptor Hash:..... {PadRight(fingerprint.DescriptorHash ?? "N/A", 40)} ║");
+                    Console.WriteLine($"║   Interface Numbers:.. {PadRight(fingerprint.InterfaceNumbers ?? fingerprint.InterfaceNumber ?? "N/A", 40)} ║");
+                    Console.WriteLine($"║   Max Packet Size 0:.. {PadRight(fingerprint.MaxPacketSize0.ToString(), 40)} ║");
+                    Console.WriteLine($"║   bcdUSB:............. 0x{fingerprint.BcdUSB:X4} ({GetUsbVersionString(fingerprint.BcdUSB),-31}) ║");
+                    Console.WriteLine($"║   bcdDevice:.......... 0x{fingerprint.BcdDevice:X4}                                       ║");
+                    Console.WriteLine($"║   Num Configurations:. {PadRight(fingerprint.NumConfigurations.ToString(), 40)} ║");
+                    Console.WriteLine($"║   Num Interfaces:..... {PadRight(fingerprint.NumInterfaces.ToString(), 40)} ║");
+                    {
+                        string attrDesc = (fingerprint.ConfigurationAttributes & 0xC0) switch
+                        {
+                            0xC0 => "Self Powered",
+                            0xE0 => "Self Powered + Remote Wakeup",
+                            _    => "Bus Powered"
+                        };
+                        Console.WriteLine($"║   Config Attributes:.. 0x{fingerprint.ConfigurationAttributes:X2} ({PadRight(attrDesc, 31)}) ║");
+                    }
+                    Console.WriteLine($"║   Max Power (mA):..... {PadRight((fingerprint.MaxPower * 2).ToString(), 40)} ║");
 
+                    // ── HASH INFORMATION ──────────────────────────────────────
                     Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
-                    Console.WriteLine($"║ ⏰ TIMESTAMP INFORMATION                                                   ║");
-
-                    string firstTime = fingerprint.FirstInstallTime != DateTime.MinValue
-                        ? fingerprint.FirstInstallTime.ToString("yyyy-MM-dd HH:mm:ss")
-                        : "N/A";
-                    string lastTime = fingerprint.LastConnectedTime != DateTime.MinValue
-                        ? fingerprint.LastConnectedTime.ToString("yyyy-MM-dd HH:mm:ss")
-                        : "N/A";
-
-                    Console.WriteLine($"║   First Install Time:. {PadRight(firstTime, 40)} ║");
-                    Console.WriteLine($"║   Last Connected Time: {PadRight(lastTime, 40)} ║");
-                    Console.WriteLine($"║   Enumeration Time:... {PadRight(fingerprint.EnumerationTimeMs + " ms", 40)} ║");
-
-                    // Hardware IDs
-                    if (fingerprint.HardwareIds?.Any() == true)
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"║ 🔐 HASH INFORMATION & SECURITY                                             ║");
+                    Console.ResetColor();
+                    Console.WriteLine($"║   Descriptor Hash:.... {PadRight(fingerprint.DescriptorHash ?? "N/A", 40)} ║");
+                    Console.WriteLine($"║     └─ Device descriptor + Config + Interfaces + Endpoints              ║");
+                    Console.WriteLine($"║   Interface Hash:..... {PadRight(fingerprint.InterfaceDescriptorHash ?? "N/A", 40)} ║");
+                    Console.WriteLine($"║     └─ Interface Class/SubClass/Protocol details                        ║");
+                    Console.WriteLine($"║   Endpoint Hash:...... {PadRight(fingerprint.EndpointDescriptorHash ?? "N/A", 40)} ║");
+                    Console.WriteLine($"║     └─ All endpoint addresses, types, max packet sizes                  ║");
+                    if (!string.IsNullOrEmpty(fingerprint.BosHash))
                     {
-                        Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
-                        Console.WriteLine($"║ 🔧 HARDWARE IDs ({fingerprint.HardwareIds.Count})                                                     ║");
-                        for (int i = 0; i < Math.Min(fingerprint.HardwareIds.Count, 3); i++)
-                        {
-                            Console.WriteLine($"║   {i + 1}. {PadRight(TruncateString(fingerprint.HardwareIds[i], 46), 46)} ║");
-                        }
-                        if (fingerprint.HardwareIds.Count > 3)
-                        {
-                            Console.WriteLine($"║   ... and {fingerprint.HardwareIds.Count - 3} more                                           ║");
-                        }
+                        Console.WriteLine($"║   BOS Hash:........... {PadRight(TruncateString(fingerprint.BosHash, 40), 40)} ║");
+                        Console.WriteLine($"║     └─ USB 3.0+ device capabilities                                  ║");
                     }
+                    Console.WriteLine($"║   HWID Hash:.......... {PadRight(fingerprint.HardwareIdHash ?? "N/A", 40)} ║");
+                    Console.WriteLine($"║   Compatible Hash:.... {PadRight(fingerprint.CompatibleIdHash ?? "N/A", 40)} ║");
 
-                    // Volume Info
-                    // Volume Serial
-                    if (fingerprint.VolumeSerialNumber? .Any() == true)
+                    // ── FORENSIC HISTORY ──────────────────────────────────────
                     {
                         Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
-                        Console.WriteLine($"║ 💾 STORAGE INFORMATION                                                    ║");
-                        Console.WriteLine($"║   Volume Serial:..... {PadRight(fingerprint.VolumeSerialNumber, 40)} ║");
-                    }
+                        Console.ForegroundColor = ConsoleColor.Cyan;
+                        Console.WriteLine($"║ 📊 FORENSIC HISTORY                                                        ║");
+                        Console.ResetColor();
 
-                    // SCSI Inquiry
-                    if (fingerprint.ScsiVendor?.Any() == true) 
-                    {
-                        Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
-                        Console.WriteLine($"║ 🔧 SCSI INQUIRY DATA                                                       ║");
-                        Console.WriteLine($"║   Vendor:............ {PadRight(fingerprint.ScsiVendor ?? "N/A", 40)} ║");
-                        Console.WriteLine($"║   Product:........... {PadRight(fingerprint.ScsiProduct ?? "N/A", 40)} ║");
-                        Console.WriteLine($"║   Revision:.......... {PadRight(fingerprint.ScsiRevision ?? "N/A", 40)} ║");
-                    }
-
-                    // Registry Keys
-                    if (fingerprint.RegistryKeys?.Any() == true)
-                    {
-                        Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
-                        Console.WriteLine($"║ 📂 REGISTRY LOCATIONS ({fingerprint.RegistryKeys.Count})                                                ║");
-                        foreach (string key in fingerprint.RegistryKeys.Take(2))
+                        DeviceHistoryRecord history = HistoryManager?.GetHistory(fingerprint);
+                        if (history != null)
                         {
-                            Console.WriteLine($"║   {PadRight(TruncateString(key, 52), 52)} ║");
+                            Console.WriteLine($"║   First Observed:..... {PadRight(history.FirstObservedTime ?? "N/A", 40)} ║");
+                            Console.WriteLine($"║   Last Observed:...... {PadRight(history.LastObservedTime ?? "N/A", 40)} ║");
+                            Console.WriteLine($"║   Total Observations: {PadRight(history.TotalObservations.ToString(), 40)} ║");
+
+                            string statusText = history.IsWhitelisted
+                                ? $"WHITELISTED (at {history.WhitelistedAt})"
+                                : "Not whitelisted";
+                            ConsoleColor statusColor = history.IsWhitelisted ? ConsoleColor.Green : ConsoleColor.Yellow;
+                            Console.Write($"║   Whitelisted:........ ");
+                            Console.ForegroundColor = statusColor;
+                            Console.Write(PadRight(statusText, 40));
+                            Console.ResetColor();
+                            Console.WriteLine(" ║");
+
+                            if (history.Events?.Count > 0)
+                            {
+                                var eventSummary = string.Join(", ", history.Events
+                                    .GroupBy(e => e.EventType)
+                                    .Select(g => g.Count() == 1 ? g.Key : $"{g.Key} x{g.Count()}"));
+                                Console.WriteLine($"║   Events Logged:...... {PadRight(TruncateString(eventSummary, 40), 40)} ║");
+                            }
                         }
-                        if (fingerprint.RegistryKeys.Count > 2)
+                        else
                         {
-                            Console.WriteLine($"║   ... and {fingerprint.RegistryKeys.Count - 2} more                                           ║");
+                            Console.ForegroundColor = ConsoleColor.Yellow;
+                            Console.WriteLine($"║   ⭐ First time this device has been seen.                          ║");
+                            Console.ResetColor();
                         }
                     }
 
-                    // ──────────────────────────────────────────
-                    // DEVICE CLASSIFICATION
-                    // ──────────────────────────────────────────
+                    // ── DEVICE CLASSIFICATION ─────────────────────────────────
                     {
                         Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
                         Console.ForegroundColor = ConsoleColor.Cyan;
@@ -994,11 +1195,10 @@ namespace USBGuardian
                         string deviceTypes = fingerprint.DeviceTypes ?? "Unknown / Not classified";
                         Console.WriteLine($"║   Device Type:........ {PadRight(deviceTypes, 40)} ║");
 
-                        // Suspicious combination detection
-                        var interfaces = fingerprint.AllInterfaces;
-                        if (interfaces != null && interfaces.Count > 0)
+                        var allIfaces = fingerprint.AllInterfaces;
+                        if (allIfaces != null && allIfaces.Count > 0)
                         {
-                            var warnings = HIDClassifier.DetectSuspiciousCombinations(interfaces);
+                            var warnings = HIDClassifier.DetectSuspiciousCombinations(allIfaces);
                             if (warnings.Count > 0)
                             {
                                 foreach (var (severity, message) in warnings)
@@ -1030,43 +1230,47 @@ namespace USBGuardian
                         }
                     }
 
-                    // ──────────────────────────────────────────
-                    // FORENSIC HISTORY
-                    // ──────────────────────────────────────────
+                    // ── HARDWARE IDs ──────────────────────────────────────────
+                    if (fingerprint.HardwareIds?.Any() == true)
                     {
                         Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
-                        Console.ForegroundColor = ConsoleColor.Cyan;
-                        Console.WriteLine($"║ 📊 FORENSIC HISTORY                                                        ║");
-                        Console.ResetColor();
-
-                        DeviceHistoryRecord history = HistoryManager?.GetHistory(fingerprint);
-                        if (history != null)
-                        {
-                            Console.WriteLine($"║   First Observed:..... {PadRight(history.FirstObservedTime ?? "N/A", 40)} ║");
-                            Console.WriteLine($"║   Last Observed:...... {PadRight(history.LastObservedTime ?? "N/A", 40)} ║");
-                            Console.WriteLine($"║   Total Observations: {PadRight(history.TotalObservations.ToString(), 40)} ║");
-
-                            string statusText = history.IsWhitelisted
-                                ? $"WHITELISTED (at {history.WhitelistedAt})"
-                                : "Not whitelisted";
-                            ConsoleColor statusColor = history.IsWhitelisted ? ConsoleColor.Green : ConsoleColor.Yellow;
-                            Console.Write($"║   Status:............. ");
-                            Console.ForegroundColor = statusColor;
-                            Console.Write(PadRight(statusText, 40));
-                            Console.ResetColor();
-                            Console.WriteLine(" ║");
-                        }
-                        else
-                        {
-                            Console.ForegroundColor = ConsoleColor.Yellow;
-                            Console.WriteLine($"║   ⭐ First time this device has been seen.                          ║");
-                            Console.ResetColor();
-                        }
+                        Console.WriteLine($"║ 🔧 HARDWARE IDs ({fingerprint.HardwareIds.Count})                                                     ║");
+                        for (int i = 0; i < Math.Min(fingerprint.HardwareIds.Count, 3); i++)
+                            Console.WriteLine($"║   {i + 1}. {PadRight(TruncateString(fingerprint.HardwareIds[i], 46), 46)} ║");
+                        if (fingerprint.HardwareIds.Count > 3)
+                            Console.WriteLine($"║   ... and {fingerprint.HardwareIds.Count - 3} more                                           ║");
                     }
 
-                    Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
+                    // ── STORAGE INFORMATION ───────────────────────────────────
+                    if (fingerprint.VolumeSerialNumber?.Any() == true || fingerprint.StorageTotalBytes > 0)
+                    {
+                        Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
+                        Console.WriteLine($"║ 💾 STORAGE INFORMATION                                                    ║");
+                        if (!string.IsNullOrEmpty(fingerprint.VolumeSerialNumber))
+                            Console.WriteLine($"║   Volume Serial:..... {PadRight(fingerprint.VolumeSerialNumber, 40)} ║");
+                        if (fingerprint.StorageTotalBytes > 0)
+                            Console.WriteLine($"║   Capacity:.......... {PadRight(TruncateString(FormatStorageSize(fingerprint.StorageTotalBytes), 40), 40)} ║");
+                    }
 
-                    // Fingerprint and Score
+                    // ── SCSI INQUIRY ──────────────────────────────────────────
+                    if (fingerprint.ScsiVendor?.Any() == true)
+                    {
+                        Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
+                        Console.WriteLine($"║ 🔧 SCSI INQUIRY DATA                                                       ║");
+                        Console.WriteLine($"║   Vendor:............ {PadRight(fingerprint.ScsiVendor ?? "N/A", 40)} ║");
+                        Console.WriteLine($"║   Product:........... {PadRight(fingerprint.ScsiProduct ?? "N/A", 40)} ║");
+                        Console.WriteLine($"║   Revision:.......... {PadRight(fingerprint.ScsiRevision ?? "N/A", 40)} ║");
+                    }
+
+                    // ── TIMESTAMP INFORMATION ─────────────────────────────────
+                    Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
+                    Console.WriteLine($"║ ⏰ TIMESTAMP INFORMATION                                                   ║");
+                    Console.WriteLine($"║   First Install Time:. {PadRight(firstTimeStr, 40)} ║");
+                    Console.WriteLine($"║   Last Connected Time: {PadRight(lastTimeStr, 40)} ║");
+                    Console.WriteLine($"║   Enumeration Time:... {PadRight(fingerprint.EnumerationTimeMs + " ms", 40)} ║");
+
+                    // ── FINGERPRINT & SCORE ───────────────────────────────────
+                    Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
                     string fingerprintHash = fingerprint.GenerateFingerprintHash();
                     Console.Write($"║ 🆔 FINGERPRINT: ");
                     Console.ForegroundColor = ConsoleColor.Magenta;
@@ -1080,18 +1284,15 @@ namespace USBGuardian
                     Console.ResetColor();
                     Console.WriteLine($" identifiers                                               ║");
 
-                    // Reliability Score
                     int reliabilityScore = CalculateReliabilityScore(fingerprint);
                     string reliabilityBar = GetReliabilityBar(reliabilityScore);
                     Console.Write($"║   Reliability:........ ");
-
                     if (reliabilityScore >= 80)
                         Console.ForegroundColor = ConsoleColor.Green;
                     else if (reliabilityScore >= 50)
                         Console.ForegroundColor = ConsoleColor.Yellow;
                     else
                         Console.ForegroundColor = ConsoleColor.Red;
-
                     Console.Write(reliabilityBar);
                     Console.ResetColor();
                     Console.Write($" {reliabilityScore}%");
@@ -1108,6 +1309,53 @@ namespace USBGuardian
                 {
                     Debug.WriteLine($"Error displaying table: {ex.Message}");
                 }
+            }
+
+            // ── DISPLAY HELPER METHODS ────────────────────────────────────────
+
+            private static string GetUsbVersionString(ushort bcdUsb) =>
+                bcdUsb switch
+                {
+                    0x0110 => "USB 1.1",
+                    0x0200 => "USB 2.0",
+                    0x0300 => "USB 3.0",
+                    0x0310 => "USB 3.1",
+                    0x0320 => "USB 3.2",
+                    0x0400 => "USB 4.0",
+                    _ => $"v{(bcdUsb >> 8) & 0xFF}.{(bcdUsb >> 4) & 0xF}{bcdUsb & 0xF}"
+                };
+
+            private static string FormatStorageSize(long bytes)
+            {
+                const long BytesPerGb  = 1_000_000_000L;
+                const long BytesPerGib = 1024L * 1024L * 1024L;
+                double gb  = bytes / (double)BytesPerGb;
+                double gib = bytes / (double)BytesPerGib;
+                return $"{gb:F1} GB / {gib:F1} GiB ({bytes:N0} Bytes)";
+            }
+
+            private static string GetPowerStateDescription(string state) =>
+                state switch
+                {
+                    "D0" => "D0 (Full Power)",
+                    "D1" => "D1 (Low Power)",
+                    "D2" => "D2 (Low Power)",
+                    "D3" => "D3 (Off / Suspended)",
+                    _    => state
+                };
+
+            private static string DecodeCapabilities(uint caps)
+            {
+                var flags = new List<string>();
+                if ((caps & 0x0001) != 0) flags.Add("Lockable");
+                if ((caps & 0x0002) != 0) flags.Add("EjectSupported");
+                if ((caps & 0x0004) != 0) flags.Add("Removable");
+                if ((caps & 0x0008) != 0) flags.Add("DockDevice");
+                if ((caps & 0x0010) != 0) flags.Add("UniqueID");
+                if ((caps & 0x0020) != 0) flags.Add("SilentInstall");
+                if ((caps & 0x0040) != 0) flags.Add("RawDeviceOk");
+                if ((caps & 0x0080) != 0) flags.Add("SurpriseRemovalOk");
+                return flags.Count > 0 ? string.Join(", ", flags) : "None";
             }
 
             // ===== HELPER METHODS =====
@@ -1572,6 +1820,26 @@ namespace USBGuardian
         public string Description { get; set; }
         public string Manufacturer { get; set; }
         public string InterfaceNumber { get; set; }
+
+        // Extended device information
+        public string InterfaceNumbers { get; set; }           // Interface numbers from USB descriptor, e.g. "0" or "0, 1, 2"
+        public string FriendlyName { get; set; }               // Windows friendly name
+        public string Win32Name { get; set; }                  // Physical drive path e.g. \\.\PHYSICALDRIVE1
+        public string KernelName { get; set; }                 // Kernel driver module e.g. disk.sys
+        public string DeviceId { get; set; }                   // Full device instance ID (USBSTOR\DISK&VEN_...)
+        public string ClassGuid { get; set; }                  // Device class GUID e.g. {4d36e967-...}
+        public string DriverKeyName { get; set; }              // Registry driver key e.g. {GUID}\0001
+        public string DriverName { get; set; }                 // Driver description
+        public string DriverVersion { get; set; }              // Driver version string
+        public string DriverDate { get; set; }                 // Driver date string
+        public string BusType { get; set; }                    // Legacy bus type e.g. "USB"
+        public string LocationInfo { get; set; }               // Location information e.g. "Port_#0019.Hub_#0001"
+        public string Address { get; set; }                    // USB port address
+        public string Enumerator { get; set; }                 // Enumerator name e.g. "USB" or "USBSTOR"
+        public uint Capabilities { get; set; }                 // Device capabilities bitmask
+        public string PowerState { get; set; }                 // Power state e.g. "D0"
+        public bool EnhancedPowerManagementEnabled { get; set; } // Enhanced power management flag
+        public long StorageTotalBytes { get; set; }            // Total storage capacity in bytes (storage devices)
 
         // Timing
         public long InsertionTimeMs { get; set; }
