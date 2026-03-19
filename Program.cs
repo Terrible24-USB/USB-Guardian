@@ -76,6 +76,7 @@ namespace USBGuardian
         private DeviceIdentifier deviceIdentifier;
         private List<DeviceFingerprint> whitelist;
         private DeviceHistoryManager historyManager;
+        private UsbGuardianCore guardianCore;
 
         public USBMessageWindow()
         {
@@ -85,6 +86,11 @@ namespace USBGuardian
             whitelist = LoadWhitelist();
             historyManager = new DeviceHistoryManager();
             deviceIdentifier.HistoryManager = historyManager;
+
+            // Initialize the 6-layer defense core
+            guardianCore = new UsbGuardianCore();
+            _ = guardianCore.InitializeAsync();
+
             Debug.WriteLine("USB Guardian Started - Monitoring for USB devices...");
         }
 
@@ -223,6 +229,23 @@ namespace USBGuardian
 
                 // Log insertion event and retrieve history
                 DeviceHistoryRecord history = historyManager.LogEvent(currentDevice, DeviceEventType.Insertion);
+
+                // =============================================
+                // 6-LAYER SECURITY EVALUATION
+                // =============================================
+                DeviceEvaluationResult evalResult = guardianCore.EvaluateDevice(currentDevice);
+                Debug.WriteLine($"[6-Layer] Threat={evalResult.OverallThreatLevel}, ShouldBlock={evalResult.ShouldBlock}");
+
+                if (evalResult.ShouldBlock)
+                {
+                    Debug.WriteLine($"🚨 THREAT DETECTED - Blocking device: {evalResult.BlockReason}");
+                    guardianCore.HandleThreat(currentDevice, evalResult);
+                    historyManager.LogEvent(currentDevice, DeviceEventType.Blocked, evalResult.BlockReason);
+                    ShowBalloonTip(
+                        "⚠️ USB Threat Blocked",
+                        $"Dangerous device blocked: {evalResult.BlockReason}");
+                    return;
+                }
 
                 bool isAllowed = false;
                 DeviceFingerprint matchedDevice = null;
