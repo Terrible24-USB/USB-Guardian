@@ -513,21 +513,42 @@ namespace USBGuardian
                     }
                 }
 
-                // ConfigFlags |= 0x100 disables the device but keeps the registry entry (reversible)
-                string instancePath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
-
-                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(instancePath, true))
+                if (UsbStorageBlocker.IsUsbStorageDevice(device))
                 {
-                    if (key != null)
+                    // USB Mass Storage: eject mounted volumes and set registry block flags
+                    Debug.WriteLine("🔒 Storage device detected — using UsbStorageBlocker");
+                    var storageBlocker = new UsbStorageBlocker(guardianCore.EventLogger);
+                    storageBlocker.BlockUsbStorageDevice(device);
+                }
+                else if (UsbStorageBlocker.IsHidDevice(device))
+                {
+                    // HID device (keyboard/mouse): ConfigFlags |= 0x100 is sufficient
+                    Debug.WriteLine("🔒 HID device detected — using ConfigFlags registry block");
+                    string instancePath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
+                    SetDeviceConfigFlags(instancePath, 0x100, "HID device");
+                }
+                else
+                {
+                    // Unknown device type: disable via WMI Win32_PnPEntity and set registry flags
+                    Debug.WriteLine("🔒 Unknown device type — disabling via WMI and setting registry flags");
+                    try
                     {
-                        int current = (int)(key.GetValue("ConfigFlags", 0) ?? 0);
-                        key.SetValue("ConfigFlags", current | 0x100, RegistryValueKind.DWord);
-                        Debug.WriteLine($"Device disabled via registry (ConfigFlags |= 0x100): {instancePath}");
+                        string wmiQuery = $"SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_{device.Vid}&PID_{device.Pid}%'";
+                        using var searcher = new System.Management.ManagementObjectSearcher(wmiQuery);
+                        foreach (System.Management.ManagementObject obj in searcher.Get())
+                        {
+                            obj.InvokeMethod("Disable", null);
+                            Debug.WriteLine($"Unknown device disabled via WMI: {obj["DeviceID"]}");
+                            break;
+                        }
                     }
-                    else
+                    catch (Exception wmiEx)
                     {
-                        Debug.WriteLine($"Registry key not found, device could not be blocked: {instancePath}");
+                        Debug.WriteLine($"WMI disable failed for unknown device: {wmiEx.Message}");
                     }
+
+                    string unknownPath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
+                    SetDeviceConfigFlags(unknownPath, 0x100, "Unknown device");
                 }
 
                 ShowBalloonTip("USB Device Blocked",
@@ -537,6 +558,25 @@ namespace USBGuardian
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error blocking device: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Opens the registry key at <paramref name="instancePath"/> under HKLM and ORs
+        /// the given <paramref name="flags"/> into the ConfigFlags DWORD value.
+        /// </summary>
+        private static void SetDeviceConfigFlags(string instancePath, int flags, string deviceLabel)
+        {
+            using RegistryKey key = Registry.LocalMachine.OpenSubKey(instancePath, true);
+            if (key != null)
+            {
+                int current = (int)(key.GetValue("ConfigFlags", 0) ?? 0);
+                key.SetValue("ConfigFlags", current | flags, RegistryValueKind.DWord);
+                Debug.WriteLine($"{deviceLabel} disabled via registry (ConfigFlags |= 0x{flags:X}): {instancePath}");
+            }
+            else
+            {
+                Debug.WriteLine($"Registry key not found for {deviceLabel}: {instancePath}");
             }
         }
 
