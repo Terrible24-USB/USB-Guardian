@@ -32,6 +32,7 @@ namespace USBGuardian
             0x0100, 0x0110, 0x0200, 0x0210, 0x0300, 0x0310, 0x0320
         };
 
+        // For USB 2.0 and earlier: 8, 16, 32, 64 bytes. For USB 3.0 SuperSpeed: 9 (meaning 2^9 = 512 bytes).
         private static readonly HashSet<byte> ValidMaxPacketSizes = new() { 8, 16, 32, 64, 9 };
 
         public DescriptorValidator(SecurityEventLogger logger)
@@ -79,7 +80,7 @@ namespace USBGuardian
                 // Validate MaxPacketSize0
                 if (!ValidMaxPacketSizes.Contains(fingerprint.MaxPacketSize0))
                 {
-                    result.Issues.Add($"MaxPacketSize0={fingerprint.MaxPacketSize0} is not a valid value (must be 8/16/32/64 or 9 for SS)");
+                    result.Issues.Add($"MaxPacketSize0={fingerprint.MaxPacketSize0} is not a valid value (must be 8/16/32/64 for USB 2.0, or 9 for USB 3.0 SuperSpeed where 2^9=512)");
                     Escalate(ref threat, ThreatLevel.Medium);
                 }
 

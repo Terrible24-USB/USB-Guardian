@@ -85,9 +85,9 @@ namespace USBGuardian
                         existing.DescriptorHash != fingerprint.DescriptorHash)
                     {
                         result.IsTampered = true;
-                        string oldPrev = existing.DescriptorHash.Length >= 8 ? existing.DescriptorHash[..8] : existing.DescriptorHash;
-                        string newPrev = fingerprint.DescriptorHash.Length >= 8 ? fingerprint.DescriptorHash[..8] : fingerprint.DescriptorHash;
-                        result.Issues.Add($"DescriptorHash changed: was {oldPrev}…, now {newPrev}…");
+                        string oldHashPreview = existing.DescriptorHash.Length >= 8 ? existing.DescriptorHash[..8] : existing.DescriptorHash;
+                        string newHashPreview = fingerprint.DescriptorHash.Length >= 8 ? fingerprint.DescriptorHash[..8] : fingerprint.DescriptorHash;
+                        result.Issues.Add($"DescriptorHash changed: was {oldHashPreview}…, now {newHashPreview}…");
                         Escalate(ref threat, ThreatLevel.Critical);
                     }
 

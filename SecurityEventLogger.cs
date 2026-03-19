@@ -31,7 +31,7 @@ namespace USBGuardian
 
     public class SecurityEventLogger
     {
-        private readonly List<SecurityEvent> _events = new();
+        private readonly Queue<SecurityEvent> _events = new();
         private readonly object _lock = new();
         private const int MaxEvents = 1000;
         private readonly string _logPath;
@@ -46,9 +46,9 @@ namespace USBGuardian
         {
             lock (_lock)
             {
-                _events.Add(evt);
+                _events.Enqueue(evt);
                 if (_events.Count > MaxEvents)
-                    _events.RemoveAt(0);
+                    _events.Dequeue();
 
                 PersistEvents();
 
@@ -80,7 +80,7 @@ namespace USBGuardian
         {
             try
             {
-                var json = JsonSerializer.Serialize(_events, new JsonSerializerOptions { WriteIndented = true });
+                var json = JsonSerializer.Serialize(_events.ToList(), new JsonSerializerOptions { WriteIndented = true });
                 File.WriteAllText(_logPath, json);
             }
             catch (Exception ex)
@@ -100,7 +100,8 @@ namespace USBGuardian
                 {
                     lock (_lock)
                     {
-                        _events.AddRange(loaded.TakeLast(MaxEvents));
+                        foreach (var evt in loaded.TakeLast(MaxEvents))
+                            _events.Enqueue(evt);
                     }
                 }
             }
