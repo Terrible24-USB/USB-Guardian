@@ -199,7 +199,7 @@ namespace USBGuardian
         // ──────────────────────────────────────────────
 
         private static string GetKey(DeviceFingerprint fp) =>
-            fp.GenerateFingerprintHash();
+            $"{fp.Vid}:{fp.Pid}:{fp.SerialNumber ?? fp.InstanceId}";
 
         private void LoadHistory()
         {
