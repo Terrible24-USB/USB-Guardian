@@ -1,0 +1,202 @@
+﻿using System;
+using System.Windows.Forms;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using Microsoft.Win32;
+
+class Program
+{
+    [STAThread]
+    static void Main()
+    {
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        Application.Run(new USBApplicationContext());
+    }
+}
+
+class USBApplicationContext : ApplicationContext
+{
+    private USBMessageWindow window;
+
+    public USBApplicationContext()
+    {
+        window = new USBMessageWindow();
+    }
+}
+
+class USBMessageWindow : NativeWindow
+{
+    private const int WM_DEVICECHANGE = 0x0219;
+    private const int DBT_DEVICEARRIVAL = 0x8000;
+    private const int DBT_DEVTYP_DEVICEINTERFACE = 0x00000005;
+    private const int DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
+
+    private static readonly Guid GUID_DEVINTERFACE_USB_DEVICE =
+        new Guid("A5DCBF10-6530-11D2-901F-00C04FB951ED");
+
+    private IntPtr notificationHandle;
+
+    public USBMessageWindow()
+    {
+        CreateHandle(new CreateParams());
+        RegisterForUsbNotifications();
+    }
+
+    // =============================
+    // REGISTER FOR USB INTERFACES
+    // =============================
+    private void RegisterForUsbNotifications()
+    {
+        DEV_BROADCAST_DEVICEINTERFACE dbi = new DEV_BROADCAST_DEVICEINTERFACE
+        {
+            dbcc_size = Marshal.SizeOf(typeof(DEV_BROADCAST_DEVICEINTERFACE)),
+            dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE,
+            dbcc_classguid = GUID_DEVINTERFACE_USB_DEVICE
+        };
+
+        IntPtr buffer = Marshal.AllocHGlobal(dbi.dbcc_size);
+        Marshal.StructureToPtr(dbi, buffer, false);
+
+        notificationHandle = RegisterDeviceNotification(
+            this.Handle,
+            buffer,
+            DEVICE_NOTIFY_WINDOW_HANDLE);
+
+        Marshal.FreeHGlobal(buffer);
+    }
+
+    // =============================
+    // MESSAGE HANDLER
+    // =============================
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_DEVICECHANGE && m.WParam.ToInt32() == DBT_DEVICEARRIVAL)
+        {
+            Debug.WriteLine("USB insertion event detected");
+
+            if (m.LParam != IntPtr.Zero)
+            {
+                DEV_BROADCAST_DEVICEINTERFACE dbi =
+                    Marshal.PtrToStructure<DEV_BROADCAST_DEVICEINTERFACE>(m.LParam);
+
+                if (dbi.dbcc_devicetype == DBT_DEVTYP_DEVICEINTERFACE)
+                {
+                    // 🔑 Read the string manually AFTER the struct
+                    IntPtr namePtr = IntPtr.Add(
+                        m.LParam,
+                        Marshal.OffsetOf<DEV_BROADCAST_DEVICEINTERFACE>("dbcc_name").ToInt32()
+                    );
+
+                    string devicePath = Marshal.PtrToStringAuto(namePtr);
+
+                    Debug.WriteLine("Device path:");
+                    Debug.WriteLine(devicePath);
+
+                    ExtractVidPid(devicePath);
+                }
+            }
+        }
+
+        base.WndProc(ref m);
+    }
+
+    private static void IdentifyDeviceType(string vid, string pid)
+    {
+        string baseKeyPath =
+            $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{vid}&PID_{pid}";
+
+        using RegistryKey baseKey =
+            Registry.LocalMachine.OpenSubKey(baseKeyPath);
+
+        if (baseKey == null)
+        {
+            Debug.WriteLine("Device not found in registry");
+            return;
+        }
+
+        foreach (string instanceId in baseKey.GetSubKeyNames())
+        {
+            using RegistryKey instanceKey = baseKey.OpenSubKey(instanceId);
+            if (instanceKey == null)
+                continue;
+
+            string service =
+                instanceKey.GetValue("Service")?.ToString() ?? "Unknown";
+
+            string deviceType = MapServiceToDeviceType(service);
+
+            Debug.WriteLine("---- DEVICE TYPE IDENTIFIED ----");
+            Debug.WriteLine($"Service    : {service}");
+            Debug.WriteLine($"DeviceType : {deviceType}");
+
+            // One instance is enough
+            break;
+        }
+    }
+    private static string MapServiceToDeviceType(string service)
+    {
+        return service switch
+        {
+            "HidUsb" => "HID (Keyboard / Mouse) ⚠️",
+            "USBSTOR" => "USB Mass Storage 💾",
+            "usbrndis6" => "USB Network Device 🌐",
+            "WUDFWpdMtp" => "Mobile / MTP Device 📱",
+            "usbvideo" => "USB Camera 📷",
+            "usbccgp" => "USB Composite Device",
+            _ => "Other USB Device"
+        };
+    }
+
+
+
+    // =============================
+    // VID / PID EXTRACTION
+    // =============================
+    private static void ExtractVidPid(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+        {
+            Debug.WriteLine("Empty device path");
+            return;
+        }
+
+        int vidIndex = path.IndexOf("VID_", StringComparison.OrdinalIgnoreCase);
+        int pidIndex = path.IndexOf("PID_", StringComparison.OrdinalIgnoreCase);
+
+        if (vidIndex < 0 || pidIndex < 0)
+        {
+            Debug.WriteLine("VID/PID not found");
+            return;
+        }
+
+        string vid = path.Substring(vidIndex + 4, 4);
+        string pid = path.Substring(pidIndex + 4, 4);
+
+        Debug.WriteLine("---- INSERTED USB DEVICE ----");
+        Debug.WriteLine($"VID : {vid}");
+        Debug.WriteLine($"PID : {pid}");
+
+        IdentifyDeviceType(vid, pid);
+
+    }
+
+    // =============================
+    // STRUCT + P/INVOKE
+    // =============================
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DEV_BROADCAST_DEVICEINTERFACE
+    {
+        public int dbcc_size;
+        public int dbcc_devicetype;
+        public int dbcc_reserved;
+        public Guid dbcc_classguid;
+        public short dbcc_name; // placeholder ONLY
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr RegisterDeviceNotification(
+        IntPtr hRecipient,
+        IntPtr NotificationFilter,
+        int Flags);
+}
