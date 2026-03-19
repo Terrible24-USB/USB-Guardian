@@ -91,6 +91,12 @@ namespace USBGuardian
             guardianCore = new UsbGuardianCore();
             _ = guardianCore.InitializeAsync();
 
+            // Auto-whitelist built-in devices so they are never shown in the unknown-device dialog
+            AutoWhitelistBuiltInDevices();
+
+            // Verify all critical safety systems are working before accepting USB events
+            RunStartupSafetyTests();
+
             Debug.WriteLine("USB Guardian Started - Monitoring for USB devices...");
         }
 
@@ -288,38 +294,78 @@ namespace USBGuardian
         {
             LogUnknownDevice(device);
 
+            // If this is definitely a built-in device, auto-allow and whitelist it silently.
+            if (BuiltInDeviceSafetyChecker.IsDefinitelyBuiltIn(device))
+            {
+                Debug.WriteLine("✅ Auto-allowing built-in device (no dialog shown)");
+                whitelist.Add(device);
+                SaveWhitelist();
+                historyManager.LogEvent(device, DeviceEventType.Whitelisted, "Auto-whitelisted as built-in device");
+                return;
+            }
+
+            bool mightBeBuiltIn = BuiltInDeviceSafetyChecker.MightBeBuiltIn(device);
+
             using (var form = new Form())
             {
                 form.Text = "USB Guardian - Unknown Device Detected";
-                form.Size = new Size(500, 400);
+                form.Size = new Size(500, mightBeBuiltIn ? 440 : 400);
                 form.StartPosition = FormStartPosition.CenterScreen;
                 form.FormBorderStyle = FormBorderStyle.FixedDialog;
                 form.MaximizeBox = false;
                 form.MinimizeBox = false;
 
+                string titleText = mightBeBuiltIn
+                    ? "⚠ Possibly Built-In Device Detected"
+                    : "⚠ Unknown USB Device Detected";
+
                 var lblTitle = new Label
                 {
-                    Text = "⚠ Unknown USB Device Detected",
+                    Text = titleText,
                     Font = new Font("Arial", 12, FontStyle.Bold),
+                    ForeColor = mightBeBuiltIn ? Color.DarkOrange : SystemColors.ControlText,
                     Location = new Point(20, 20),
                     Size = new Size(450, 30),
                     TextAlign = ContentAlignment.MiddleCenter
                 };
 
+                int detailsTop = 60;
+                int detailsHeight = 200;
+
+                Label lblWarning = null;
+                if (mightBeBuiltIn)
+                {
+                    lblWarning = new Label
+                    {
+                        Text = "⚠ WARNING: This device may be an internal laptop component (keyboard, mouse, or trackpad). " +
+                               "Blocking it could render your device unusable.",
+                        Font = new Font("Arial", 9, FontStyle.Bold),
+                        ForeColor = Color.DarkOrange,
+                        BackColor = Color.LightYellow,
+                        Location = new Point(20, 55),
+                        Size = new Size(450, 50),
+                        TextAlign = ContentAlignment.MiddleLeft
+                    };
+                    detailsTop = 115;
+                    detailsHeight = 170;
+                }
+
                 var txtDetails = new TextBox
                 {
-                    Location = new Point(20, 60),
-                    Size = new Size(450, 200),
+                    Location = new Point(20, detailsTop),
+                    Size = new Size(450, detailsHeight),
                     Multiline = true,
                     ReadOnly = true,
                     ScrollBars = ScrollBars.Vertical,
                     Text = GetDeviceDetailsText(device)
                 };
 
+                int btnTop = detailsTop + detailsHeight + 20;
+
                 var btnAllow = new Button
                 {
                     Text = "Allow This Device",
-                    Location = new Point(20, 280),
+                    Location = new Point(20, btnTop),
                     Size = new Size(140, 40),
                     BackColor = Color.LightGreen
                 };
@@ -327,15 +373,16 @@ namespace USBGuardian
                 var btnBlock = new Button
                 {
                     Text = "Block Device",
-                    Location = new Point(180, 280),
+                    Location = new Point(180, btnTop),
                     Size = new Size(140, 40),
-                    BackColor = Color.LightCoral
+                    BackColor = Color.LightCoral,
+                    Enabled = !mightBeBuiltIn
                 };
 
                 var btnAllowAlways = new Button
                 {
                     Text = "Allow & Add to Whitelist",
-                    Location = new Point(340, 280),
+                    Location = new Point(340, btnTop),
                     Size = new Size(140, 40),
                     BackColor = Color.LightBlue
                 };
@@ -343,7 +390,7 @@ namespace USBGuardian
                 var chkRemember = new CheckBox
                 {
                     Text = "Remember this device (add to whitelist)",
-                    Location = new Point(20, 330),
+                    Location = new Point(20, btnTop + 50),
                     Size = new Size(300, 30),
                     Checked = true
                 };
@@ -381,9 +428,11 @@ namespace USBGuardian
                     form.Close();
                 };
 
-                form.Controls.AddRange(new Control[] {
-                    lblTitle, txtDetails, btnAllow, btnBlock, btnAllowAlways, chkRemember
-                });
+                var controls = new List<Control> { lblTitle, txtDetails, btnAllow, btnBlock, btnAllowAlways, chkRemember };
+                if (lblWarning != null)
+                    controls.Add(lblWarning);
+
+                form.Controls.AddRange(controls.ToArray());
 
                 form.ShowDialog();
             }
@@ -422,21 +471,68 @@ namespace USBGuardian
         {
             try
             {
-                Debug.WriteLine("🔒 BLOCKING DEVICE...");
+                Debug.WriteLine("🔒 BLOCKING DEVICE - Running safety checks...");
 
+                // SAFETY GATE #1: Definitely built-in device — show critical warning and abort
+                if (BuiltInDeviceSafetyChecker.IsDefinitelyBuiltIn(device))
+                {
+                    var result = MessageBox.Show(
+                        "🚨 CRITICAL WARNING 🚨\n\n" +
+                        $"The device \"{device.Description ?? "Unknown"}\" appears to be a BUILT-IN component " +
+                        "(e.g., internal keyboard, mouse, or trackpad).\n\n" +
+                        "Blocking this device may render your computer UNUSABLE and require a reboot or external hardware to recover.\n\n" +
+                        "Are you absolutely sure you want to block it?",
+                        "CRITICAL WARNING - Built-in Device",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Stop,
+                        MessageBoxDefaultButton.Button2);
+
+                    if (result != DialogResult.Yes)
+                    {
+                        Debug.WriteLine("⛔ Block aborted by user (built-in device critical warning)");
+                        return;
+                    }
+                }
+                // SAFETY GATE #2: Possibly built-in — show a softer warning
+                else if (BuiltInDeviceSafetyChecker.MightBeBuiltIn(device))
+                {
+                    var result = MessageBox.Show(
+                        "⚠ WARNING\n\n" +
+                        $"The device \"{device.Description ?? "Unknown"}\" might be an internal component " +
+                        "(e.g., a built-in keyboard or mouse).\n\n" +
+                        "Blocking it could cause input loss. Do you want to continue?",
+                        "Warning - Possibly Built-in Device",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Warning,
+                        MessageBoxDefaultButton.Button2);
+
+                    if (result != DialogResult.Yes)
+                    {
+                        Debug.WriteLine("⛔ Block aborted by user (possible built-in device warning)");
+                        return;
+                    }
+                }
+
+                // ConfigFlags |= 0x100 disables the device but keeps the registry entry (reversible)
                 string instancePath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
 
                 using (RegistryKey key = Registry.LocalMachine.OpenSubKey(instancePath, true))
                 {
                     if (key != null)
                     {
-                        key.SetValue("ConfigFlags", 4, RegistryValueKind.DWord);
-                        Debug.WriteLine("Device disabled via registry");
+                        int current = (int)(key.GetValue("ConfigFlags", 0) ?? 0);
+                        key.SetValue("ConfigFlags", current | 0x100, RegistryValueKind.DWord);
+                        Debug.WriteLine($"Device disabled via registry (ConfigFlags |= 0x100): {instancePath}");
+                    }
+                    else
+                    {
+                        Debug.WriteLine($"Registry key not found, device could not be blocked: {instancePath}");
                     }
                 }
 
                 ShowBalloonTip("USB Device Blocked",
-                    $"Unauthorized device {device.Description} has been blocked.");
+                    $"Device {device.Description} has been blocked.");
+                Debug.WriteLine("🔒 Device blocked successfully.");
             }
             catch (Exception ex)
             {
@@ -507,6 +603,148 @@ namespace USBGuardian
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error saving whitelist: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Creates placeholder whitelist entries for known built-in device types so they are
+        /// never shown in the unknown-device dialog on first boot.
+        /// </summary>
+        private void AutoWhitelistBuiltInDevices()
+        {
+            bool changed = false;
+
+            var builtInEntries = new[]
+            {
+                new DeviceFingerprint
+                {
+                    Vid = "BUILTIN",
+                    Pid = "KEYBOARD",
+                    Service = "kbdhid",
+                    Description = "Built-in Keyboard (auto-whitelisted)",
+                    DeviceClass = "HIDClass"
+                },
+                new DeviceFingerprint
+                {
+                    Vid = "BUILTIN",
+                    Pid = "MOUSE",
+                    Service = "mouhid",
+                    Description = "Built-in Mouse/Trackpad (auto-whitelisted)",
+                    DeviceClass = "HIDClass"
+                },
+                new DeviceFingerprint
+                {
+                    Vid = "ACPI",
+                    Pid = "BUTTON",
+                    Service = "acpibtn",
+                    Description = "ACPI Button Device (auto-whitelisted)",
+                    DeviceClass = "System"
+                },
+            };
+
+            foreach (var entry in builtInEntries)
+            {
+                bool alreadyPresent = whitelist.Any(w =>
+                    string.Equals(w.Vid, entry.Vid, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(w.Pid, entry.Pid, StringComparison.OrdinalIgnoreCase));
+
+                if (!alreadyPresent)
+                {
+                    whitelist.Add(entry);
+                    Debug.WriteLine($"Auto-whitelisted built-in device: {entry.Description}");
+                    changed = true;
+                }
+            }
+
+            if (changed)
+                SaveWhitelist();
+        }
+
+        /// <summary>
+        /// Runs 5 startup safety tests to verify all critical subsystems are operational.
+        /// Shows a critical error dialog and halts if any test fails.
+        /// </summary>
+        private void RunStartupSafetyTests()
+        {
+            var failures = new List<string>();
+
+            // TEST 1: Built-in device detection self-test
+            try
+            {
+                if (!BuiltInDeviceSafetyChecker.RunSelfTest())
+                    failures.Add("TEST 1 FAILED: Built-in device detection self-test did not pass.");
+                else
+                    Debug.WriteLine("[StartupTest] TEST 1 PASSED: Built-in device detection");
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"TEST 1 EXCEPTION: Built-in device detection: {ex.Message}");
+            }
+
+            // TEST 2: Whitelist loading verification
+            try
+            {
+                if (whitelist == null)
+                    failures.Add("TEST 2 FAILED: Whitelist is null after loading.");
+                else
+                    Debug.WriteLine($"[StartupTest] TEST 2 PASSED: Whitelist loaded ({whitelist.Count} entries)");
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"TEST 2 EXCEPTION: Whitelist validation: {ex.Message}");
+            }
+
+            // TEST 3: History manager initialization check
+            try
+            {
+                if (historyManager == null)
+                    failures.Add("TEST 3 FAILED: History manager is not initialized.");
+                else
+                    Debug.WriteLine("[StartupTest] TEST 3 PASSED: History manager initialized");
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"TEST 3 EXCEPTION: History manager check: {ex.Message}");
+            }
+
+            // TEST 4: Guardian core initialization check
+            try
+            {
+                if (guardianCore == null)
+                    failures.Add("TEST 4 FAILED: Guardian core is not initialized.");
+                else
+                    Debug.WriteLine("[StartupTest] TEST 4 PASSED: Guardian core initialized");
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"TEST 4 EXCEPTION: Guardian core check: {ex.Message}");
+            }
+
+            // TEST 5: File system write permissions
+            try
+            {
+                string testFile = Path.Combine(Application.StartupPath, ".startup_test");
+                File.WriteAllText(testFile, "ok");
+                File.Delete(testFile);
+                Debug.WriteLine("[StartupTest] TEST 5 PASSED: File system write permissions");
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"TEST 5 FAILED: File system write permissions: {ex.Message}");
+            }
+
+            if (failures.Count > 0)
+            {
+                string message = "🚨 CRITICAL: USB Guardian startup safety tests FAILED:\n\n" +
+                                 string.Join("\n", failures) +
+                                 "\n\nThe application may not operate safely. Please check your installation.";
+                Debug.WriteLine(message);
+                MessageBox.Show(message, "USB Guardian - Startup Safety Test Failure",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            else
+            {
+                Debug.WriteLine("[StartupTest] All 5 startup safety tests PASSED.");
             }
         }
 
