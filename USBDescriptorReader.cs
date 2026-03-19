@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -518,6 +519,29 @@ namespace USBGuardian
 
                         fingerprint.InterfaceDescriptorHash = ComputeDescriptorHash(interfaces);
                         fingerprint.EndpointDescriptorHash = ComputeDescriptorHash(endpoints);
+
+                        // Populate per-interface class info
+                        if (interfaces.Count > 0)
+                        {
+                            // Use the first interface as the primary classification
+                            fingerprint.InterfaceClass    = interfaces[0].bInterfaceClass;
+                            fingerprint.InterfaceSubClass = interfaces[0].bInterfaceSubClass;
+                            fingerprint.InterfaceProtocol = interfaces[0].bInterfaceProtocol;
+
+                            Debug.WriteLine($"[USBDescriptorReader] Interface[0] Class: 0x{interfaces[0].bInterfaceClass:X2}, " +
+                                            $"SubClass: 0x{interfaces[0].bInterfaceSubClass:X2}, " +
+                                            $"Protocol: 0x{interfaces[0].bInterfaceProtocol:X2}");
+
+                            // Populate full list for multi-interface composite devices
+                            fingerprint.AllInterfaces = interfaces
+                                .Select(i => new HIDClassifier.InterfaceInfo
+                                {
+                                    InterfaceClass    = i.bInterfaceClass,
+                                    InterfaceSubClass = i.bInterfaceSubClass,
+                                    InterfaceProtocol = i.bInterfaceProtocol
+                                })
+                                .ToList();
+                        }
                     }
 
                     // ===== Read BOS Descriptor =====

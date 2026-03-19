@@ -75,6 +75,7 @@ namespace USBGuardian
         private IntPtr notificationHandle;
         private DeviceIdentifier deviceIdentifier;
         private List<DeviceFingerprint> whitelist;
+        private DeviceHistoryManager historyManager;
 
         public USBMessageWindow()
         {
@@ -82,6 +83,8 @@ namespace USBGuardian
             RegisterForUsbNotifications();
             deviceIdentifier = new DeviceIdentifier();
             whitelist = LoadWhitelist();
+            historyManager = new DeviceHistoryManager();
+            deviceIdentifier.HistoryManager = historyManager;
             Debug.WriteLine("USB Guardian Started - Monitoring for USB devices...");
         }
 
@@ -218,6 +221,9 @@ namespace USBGuardian
                 Debug.WriteLine($"Enumeration Time: {currentDevice.EnumerationTimeMs} ms");
                 Debug.WriteLine($"Captured {currentDevice.IdentifierCount} identifiers for this device");
 
+                // Log insertion event and retrieve history
+                DeviceHistoryRecord history = historyManager.LogEvent(currentDevice, DeviceEventType.Insertion);
+
                 bool isAllowed = false;
                 DeviceFingerprint matchedDevice = null;
 
@@ -236,6 +242,8 @@ namespace USBGuardian
                     Debug.WriteLine("✅ DEVICE ALLOWED - Found in whitelist");
                     matchedDevice.LastConnectedTime = DateTime.UtcNow;
                     SaveWhitelist();
+
+                    historyManager.LogEvent(currentDevice, DeviceEventType.Whitelisted, "Matched existing whitelist entry");
 
                     ShowBalloonTip(
                         "USB Device Allowed",
@@ -323,6 +331,7 @@ namespace USBGuardian
                     {
                         whitelist.Add(device);
                         SaveWhitelist();
+                        historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User chose Allow & Remember");
                         ShowBalloonTip("Device Whitelisted",
                             $"{device.Description} has been added to the whitelist.");
                     }
@@ -333,6 +342,7 @@ namespace USBGuardian
                 btnBlock.Click += (s, e) =>
                 {
                     BlockDevice(device);
+                    historyManager.LogEvent(device, DeviceEventType.Blocked, "User manually blocked device");
                     form.DialogResult = DialogResult.No;
                     form.Close();
                 };
@@ -341,6 +351,7 @@ namespace USBGuardian
                 {
                     whitelist.Add(device);
                     SaveWhitelist();
+                    historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User chose Allow & Add to Whitelist");
                     ShowBalloonTip("Device Whitelisted",
                         $"{device.Description} has been added to the whitelist.");
                     form.DialogResult = DialogResult.Yes;
@@ -521,6 +532,11 @@ namespace USBGuardian
         // =============================
         public class DeviceIdentifier
         {
+            /// <summary>
+            /// Optional reference to the device history manager. When set,
+            /// <see cref="DisplayIdentifiersTable"/> will show forensic history.
+            /// </summary>
+            public DeviceHistoryManager? HistoryManager { get; set; }
 
             private string GetVolumeSerialForDevice(string vid, string pid, string instanceId)
             {
@@ -728,7 +744,24 @@ namespace USBGuardian
                     fingerprint.DescriptorHash = GenerateFallbackDescriptorHash(fingerprint);
                 }
 
+                // ===== HID DEVICE CLASSIFICATION =====
+                // Classify device types using interface descriptors (populated by USBDescriptorReader)
+                if (fingerprint.AllInterfaces != null && fingerprint.AllInterfaces.Count > 0)
+                {
+                    List<string> types = HIDClassifier.DetectDeviceTypes(fingerprint.AllInterfaces);
+                    fingerprint.DeviceTypes = types.Count > 0 ? string.Join(" + ", types) : null;
+                }
+                else if (fingerprint.InterfaceClass > 0)
+                {
+                    // Fall back to single interface classification
+                    string singleType = HIDClassifier.ClassifyInterface(
+                        fingerprint.InterfaceClass,
+                        fingerprint.InterfaceSubClass,
+                        fingerprint.InterfaceProtocol);
+                    fingerprint.DeviceTypes = singleType;
+                }
 
+                Debug.WriteLine($"Device Types: {fingerprint.DeviceTypes ?? "Unknown"}");
 
                 Debug.WriteLine($"DevicePath: {devicePath}");
                 Debug.WriteLine($"InstanceID: {instanceId}");
@@ -738,7 +771,7 @@ namespace USBGuardian
 
                 Debug.WriteLine($"\n✓ CAPTURED {fingerprint.IdentifierCount} IDENTIFIERS FOR THIS DEVICE");
 
-                
+
 
                 string vendor;
                 string product;
@@ -867,6 +900,14 @@ namespace USBGuardian
                     Console.WriteLine($"║   USB Device Class:... 0x{fingerprint.UsbDeviceClass:X2} ({fingerprint.UsbDeviceClass})           ║");
                     Console.WriteLine($"║   USB SubClass:....... 0x{fingerprint.UsbDeviceSubClass:X2}              ║");
                     Console.WriteLine($"║   USB Protocol:....... 0x{fingerprint.UsbDeviceProtocol:X2}              ║");
+                    {
+                        string ifClassName  = HIDClassifier.GetClassName(fingerprint.InterfaceClass);
+                        string ifSubCls     = HIDClassifier.GetSubClassName(fingerprint.InterfaceClass, fingerprint.InterfaceSubClass);
+                        string ifProto      = HIDClassifier.GetProtocolName(fingerprint.InterfaceClass, fingerprint.InterfaceSubClass, fingerprint.InterfaceProtocol);
+                        Console.WriteLine($"║   Interface Class:.... 0x{fingerprint.InterfaceClass:X2} ({PadRight(ifClassName, 29)}) ║");
+                        Console.WriteLine($"║   Interface SubClass:. 0x{fingerprint.InterfaceSubClass:X2} ({PadRight(ifSubCls, 29)}) ║");
+                        Console.WriteLine($"║   Interface Protocol:. 0x{fingerprint.InterfaceProtocol:X2} ({PadRight(ifProto, 29)}) ║");
+                    }
                     Console.WriteLine($"║   Max Packet Size 0:... {fingerprint.MaxPacketSize0}                      ║");
                     Console.WriteLine($"║   bcdUSB:.............. 0x{fingerprint.BcdUSB:X4}                         ║");
                     Console.WriteLine($"║   bcdDevice:........... 0x{fingerprint.BcdDevice:X4}                      ║");
@@ -938,6 +979,88 @@ namespace USBGuardian
                         if (fingerprint.RegistryKeys.Count > 2)
                         {
                             Console.WriteLine($"║   ... and {fingerprint.RegistryKeys.Count - 2} more                                           ║");
+                        }
+                    }
+
+                    // ──────────────────────────────────────────
+                    // DEVICE CLASSIFICATION
+                    // ──────────────────────────────────────────
+                    {
+                        Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
+                        Console.ForegroundColor = ConsoleColor.Cyan;
+                        Console.WriteLine($"║ 🎯 DEVICE CLASSIFICATION                                                   ║");
+                        Console.ResetColor();
+
+                        string deviceTypes = fingerprint.DeviceTypes ?? "Unknown / Not classified";
+                        Console.WriteLine($"║   Device Type:........ {PadRight(deviceTypes, 40)} ║");
+
+                        // Suspicious combination detection
+                        var interfaces = fingerprint.AllInterfaces;
+                        if (interfaces != null && interfaces.Count > 0)
+                        {
+                            var warnings = HIDClassifier.DetectSuspiciousCombinations(interfaces);
+                            if (warnings.Count > 0)
+                            {
+                                foreach (var (severity, message) in warnings)
+                                {
+                                    string[] lines = message.Split('\n');
+                                    if (severity == "CRITICAL")
+                                    {
+                                        Console.ForegroundColor = ConsoleColor.Red;
+                                        Console.WriteLine($"║ 🚨 CRITICAL: {PadRight(lines[0], 50)} ║");
+                                        for (int li = 1; li < lines.Length; li++)
+                                            Console.WriteLine($"║   {PadRight(lines[li].TrimStart(), 56)} ║");
+                                    }
+                                    else
+                                    {
+                                        Console.ForegroundColor = ConsoleColor.Yellow;
+                                        Console.WriteLine($"║ ⚠️  WARNING: {PadRight(lines[0], 51)} ║");
+                                        for (int li = 1; li < lines.Length; li++)
+                                            Console.WriteLine($"║   {PadRight(lines[li].TrimStart(), 56)} ║");
+                                    }
+                                    Console.ResetColor();
+                                }
+                            }
+                            else
+                            {
+                                Console.ForegroundColor = ConsoleColor.Green;
+                                Console.WriteLine($"║   ✅ No suspicious interface combinations detected.              ║");
+                                Console.ResetColor();
+                            }
+                        }
+                    }
+
+                    // ──────────────────────────────────────────
+                    // FORENSIC HISTORY
+                    // ──────────────────────────────────────────
+                    {
+                        Console.WriteLine("╠════════════════════════════════════════════════════════════════════════════╣");
+                        Console.ForegroundColor = ConsoleColor.Cyan;
+                        Console.WriteLine($"║ 📊 FORENSIC HISTORY                                                        ║");
+                        Console.ResetColor();
+
+                        DeviceHistoryRecord history = HistoryManager?.GetHistory(fingerprint);
+                        if (history != null)
+                        {
+                            Console.WriteLine($"║   First Observed:..... {PadRight(history.FirstObservedTime ?? "N/A", 40)} ║");
+                            Console.WriteLine($"║   Last Observed:...... {PadRight(history.LastObservedTime ?? "N/A", 40)} ║");
+                            Console.WriteLine($"║   Total Observations: {PadRight(history.TotalObservations.ToString(), 40)} ║");
+
+                            string statusText = history.IsWhitelisted
+                                ? $"WHITELISTED (at {history.WhitelistedAt})"
+                                : "Not whitelisted";
+                            ConsoleColor statusColor = history.IsWhitelisted ? ConsoleColor.Green : ConsoleColor.Yellow;
+                            Console.Write($"║   Status:............. ");
+                            Console.ForegroundColor = statusColor;
+                            Console.Write(PadRight(statusText, 40));
+                            Console.ResetColor();
+                            Console.WriteLine(" ║");
+                        }
+                        else
+                        {
+                            Console.ForegroundColor = ConsoleColor.Yellow;
+                            Console.WriteLine($"║   ⭐ First time this device has been seen.                          ║");
+                            Console.ResetColor();
                         }
                     }
 
@@ -1018,6 +1141,10 @@ namespace USBGuardian
                         writer.WriteLine($"First Install: {fingerprint.FirstInstallTime:yyyy-MM-dd HH:mm:ss}");
                         writer.WriteLine($"Class (str): {fingerprint.DeviceClass ?? "Unknown"}");
                         writer.WriteLine($"USB Class: 0x{fingerprint.UsbDeviceClass:X2}");
+                        writer.WriteLine($"Interface Class: 0x{fingerprint.InterfaceClass:X2} ({HIDClassifier.GetClassName(fingerprint.InterfaceClass)})");
+                        writer.WriteLine($"Interface SubClass: 0x{fingerprint.InterfaceSubClass:X2} ({HIDClassifier.GetSubClassName(fingerprint.InterfaceClass, fingerprint.InterfaceSubClass)})");
+                        writer.WriteLine($"Interface Protocol: 0x{fingerprint.InterfaceProtocol:X2} ({HIDClassifier.GetProtocolName(fingerprint.InterfaceClass, fingerprint.InterfaceSubClass, fingerprint.InterfaceProtocol)})");
+                        writer.WriteLine($"Device Types: {fingerprint.DeviceTypes ?? "Unknown"}");
                         writer.WriteLine($"Service: {fingerprint.Service ?? "Unknown"}");
                         writer.WriteLine($"Descriptor Hash: {fingerprint.DescriptorHash ?? "N/A"}");
                         writer.WriteLine($"Fingerprint: {fingerprint.GenerateFingerprintHash()}");
@@ -1420,6 +1547,18 @@ namespace USBGuardian
         public string EndpointDescriptorHash { get; set; }
         public string DescriptorHash { get; set; }
 
+        // Interface descriptor fields (first interface, or most representative)
+        public byte InterfaceClass { get; set; }
+        public byte InterfaceSubClass { get; set; }
+        public byte InterfaceProtocol { get; set; }
+
+        // All interface class/subclass/protocol tuples for multi-interface devices
+        [System.Xml.Serialization.XmlIgnore]
+        public List<HIDClassifier.InterfaceInfo> AllInterfaces { get; set; }
+
+        // HID device type classification (e.g., "🖱️ Mouse + ⌨️ Keyboard")
+        public string DeviceTypes { get; set; }
+
         // Timestamps
         public DateTime FirstInstallTime { get; set; }
         public DateTime LastConnectedTime { get; set; }
@@ -1455,6 +1594,7 @@ namespace USBGuardian
             RegistryKeys = new List<string>();
             HardwareIds = new List<string>();
             CompatibleIds = new List<string>();
+            AllInterfaces = new List<HIDClassifier.InterfaceInfo>();
         }
 
         public string GenerateFingerprintHash()
