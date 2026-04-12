@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Management;
 using Microsoft.Win32;
@@ -17,6 +18,13 @@ namespace USBGuardian
         private const int ServiceDisabled = 4;           // SERVICE_DISABLED
 
         private readonly SecurityEventLogger _logger;
+
+        /// <summary>
+        /// Optional persistent store for blocked-device records.
+        /// When set, <see cref="BlockUsbStorageDevice"/> writes a
+        /// <see cref="BlockedDeviceRecord"/> so the block can be reversed later.
+        /// </summary>
+        public BlockedDeviceStore? Store { get; set; }
 
         public UsbStorageBlocker(SecurityEventLogger logger)
         {
@@ -51,12 +59,15 @@ namespace USBGuardian
         /// <summary>
         /// Fully blocks a USB Mass Storage device: ejects mounted volumes,
         /// dismounts the volume, and sets registry flags to prevent re-enumeration.
+        /// If <see cref="Store"/> is configured, persists a <see cref="BlockedDeviceRecord"/>
+        /// so the block can be reversed later via the Unblock Devices UI.
         /// Returns true if at least the eject or registry step succeeded.
         /// </summary>
         public bool BlockUsbStorageDevice(DeviceFingerprint device)
         {
             string vidPid = $"{device.Vid}:{device.Pid}";
             bool anySuccess = false;
+            var actions = new List<BlockActionRecord>();
 
             try
             {
@@ -74,8 +85,8 @@ namespace USBGuardian
                     Debug.WriteLine($"[UsbStorageBlocker] Eject did not complete for {vidPid} — continuing with registry block");
                 }
 
-                // Step 2: Set registry flags to prevent re-enumeration
-                bool flagged = SetPermanentBlockFlags(device);
+                // Step 2: Set registry flags to prevent re-enumeration (captures previous values)
+                bool flagged = SetPermanentBlockFlags(device, actions);
                 if (flagged)
                 {
                     anySuccess = true;
@@ -83,6 +94,18 @@ namespace USBGuardian
                 }
 
                 _logger.LogCritical(0, "StorageBlock", $"USB storage block complete for {vidPid}: eject={ejected}, registry={flagged}", vidPid);
+
+                // Persist the record for later reversal
+                Store?.AddOrUpdate(new BlockedDeviceRecord
+                {
+                    Vid = device.Vid ?? string.Empty,
+                    Pid = device.Pid ?? string.Empty,
+                    InstanceId = device.InstanceId ?? string.Empty,
+                    SerialNumber = device.SerialNumber ?? string.Empty,
+                    Description = device.Description ?? string.Empty,
+                    BlockReason = "USB Mass Storage blocked",
+                    Actions = actions
+                });
             }
             catch (Exception ex)
             {
@@ -231,9 +254,12 @@ namespace USBGuardian
         /// <summary>
         /// Sets registry flags on the USB device and USBSTOR entries to prevent
         /// Windows from re-enumerating and re-mounting the device.
+        /// Captures the previous values of every key/value changed into
+        /// <paramref name="actionLog"/> so the changes can be reversed later.
         /// Returns true if at least one registry key was updated.
         /// </summary>
-        public bool SetPermanentBlockFlags(DeviceFingerprint device)
+        public bool SetPermanentBlockFlags(DeviceFingerprint device,
+            List<BlockActionRecord>? actionLog = null)
         {
             bool success = false;
             try
@@ -244,22 +270,38 @@ namespace USBGuardian
                 {
                     if (key != null)
                     {
-                        int current = key.GetValue("ConfigFlags") is int f ? f : 0;
-                        key.SetValue("ConfigFlags", current | ConfigFlagDisabled | ConfigFlagReinstall, RegistryValueKind.DWord);
+                        int previous = key.GetValue("ConfigFlags") is int f ? f : 0;
+                        key.SetValue("ConfigFlags", previous | ConfigFlagDisabled | ConfigFlagReinstall, RegistryValueKind.DWord);
                         success = true;
                         Debug.WriteLine($"[UsbStorageBlocker] Set ConfigFlags on {usbInstancePath}");
+
+                        actionLog?.Add(new BlockActionRecord
+                        {
+                            ActionType = "ConfigFlags",
+                            RegistryPath = usbInstancePath,
+                            PreviousConfigFlags = previous
+                        });
                     }
                 }
 
-                // 2. Disable the usbstor service start type to prevent driver from loading on rescan
+                // 2. Disable the usbstor service — capture the previous Start value for rollback
                 string svcPath = @"SYSTEM\CurrentControlSet\Services\usbstor";
                 using (var svcKey = Registry.LocalMachine.OpenSubKey(svcPath, writable: true))
                 {
                     if (svcKey != null)
                     {
+                        int previousStart = svcKey.GetValue("Start") is int sv ? sv : 3; // 3 = Demand Start
                         svcKey.SetValue("Start", ServiceDisabled, RegistryValueKind.DWord);
                         success = true;
-                        Debug.WriteLine($"[UsbStorageBlocker] Disabled usbstor service");
+                        Debug.WriteLine($"[UsbStorageBlocker] Disabled usbstor service (was Start={previousStart})");
+
+                        actionLog?.Add(new BlockActionRecord
+                        {
+                            ActionType = "ServiceStart",
+                            RegistryPath = svcPath,
+                            ServiceName = "usbstor",
+                            PreviousServiceStart = previousStart
+                        });
                     }
                 }
 
@@ -271,10 +313,17 @@ namespace USBGuardian
                     using var storKey = Registry.LocalMachine.OpenSubKey(usbStorPath, writable: true);
                     if (storKey != null)
                     {
-                        int current = storKey.GetValue("ConfigFlags") is int sf ? sf : 0;
-                        storKey.SetValue("ConfigFlags", current | ConfigFlagDisabled | ConfigFlagReinstall, RegistryValueKind.DWord);
+                        int previous = storKey.GetValue("ConfigFlags") is int sf ? sf : 0;
+                        storKey.SetValue("ConfigFlags", previous | ConfigFlagDisabled | ConfigFlagReinstall, RegistryValueKind.DWord);
                         success = true;
                         Debug.WriteLine($"[UsbStorageBlocker] Set ConfigFlags on USBSTOR path: {usbStorPath}");
+
+                        actionLog?.Add(new BlockActionRecord
+                        {
+                            ActionType = "ConfigFlags",
+                            RegistryPath = usbStorPath,
+                            PreviousConfigFlags = previous
+                        });
                     }
                 }
             }
