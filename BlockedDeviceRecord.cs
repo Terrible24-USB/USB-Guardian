@@ -57,7 +57,7 @@ namespace USBGuardian
         /// <summary>
         /// Registry key path relative to HKLM that was modified (for ConfigFlags and
         /// ServiceStart actions). Example:
-        ///   SYSTEM\CurrentControlSet\Enum\USB\VID_1234&amp;PID_5678\ABCDEF01
+        ///   SYSTEM\CurrentControlSet\Enum\USB\VID_1234&PID_5678\ABCDEF01
         /// </summary>
         public string RegistryPath { get; set; } = string.Empty;
 

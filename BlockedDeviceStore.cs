@@ -19,7 +19,7 @@ namespace USBGuardian
     ///   for other records).
     /// - Thread-safe via an internal lock.
     ///
-    /// Default file location: &lt;Application.StartupPath&gt;\blocked_devices.json
+    /// Default file location: <Application.StartupPath>\blocked_devices.json
     /// </summary>
     public class BlockedDeviceStore
     {
