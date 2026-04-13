@@ -160,7 +160,7 @@ namespace USBGuardian
             {
                 Debug.WriteLine($"[Startup] Emergency recovery check failed: {ex.Message}");
                 guardianCore?.EventLogger?.LogWarning(0, "EmergencyRecoveryError",
-                    $"Emergency recovery check failed at startup: {ex.Message}");
+                    $"Emergency recovery check failed at startup: {ex}");
             }
 
             Debug.WriteLine("USB Guardian Started - Monitoring for USB devices...");
