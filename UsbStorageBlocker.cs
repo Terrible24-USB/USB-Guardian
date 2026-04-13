@@ -15,7 +15,6 @@ namespace USBGuardian
         // ConfigFlags bit values used to prevent Windows from re-enumerating the device
         private const int ConfigFlagDisabled = 0x100;   // CONFIGFLAG_DISABLED
         private const int ConfigFlagReinstall = 0x40;   // CONFIGFLAG_REINSTALL (prevents auto re-install)
-        private const int ServiceDisabled = 4;           // SERVICE_DISABLED
 
         private readonly SecurityEventLogger _logger;
 
@@ -253,10 +252,16 @@ namespace USBGuardian
         }
 
         /// <summary>
-        /// Sets registry flags on the USB device and USBSTOR entries to prevent
-        /// Windows from re-enumerating and re-mounting the device.
+        /// Sets per-device registry ConfigFlags on the USB and USBSTOR instance keys to
+        /// prevent Windows from re-enumerating and re-mounting the specific device.
         /// Captures the previous values of every key/value changed into
         /// <paramref name="actionLog"/> so the changes can be reversed later.
+        ///
+        /// NOTE: This method intentionally does NOT disable the global USBSTOR service.
+        /// Disabling the service would brick all USB storage, not just the target device.
+        /// USB Guardian is a whitelisting product; per-device ConfigFlags are the correct
+        /// per-instance enforcement mechanism.
+        ///
         /// Returns true if at least one registry key was updated.
         /// </summary>
         public bool SetPermanentBlockFlags(DeviceFingerprint device,
@@ -265,7 +270,7 @@ namespace USBGuardian
             bool success = false;
             try
             {
-                // 1. Set ConfigFlags on the USB\VID_...\PID_... instance key
+                // 1. Set ConfigFlags on the USB\VID_...\PID_... instance key (per-device disable)
                 string usbInstancePath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
                 using (var key = Registry.LocalMachine.OpenSubKey(usbInstancePath, writable: true))
                 {
@@ -285,28 +290,7 @@ namespace USBGuardian
                     }
                 }
 
-                // 2. Disable the usbstor service — capture the previous Start value for rollback
-                string svcPath = @"SYSTEM\CurrentControlSet\Services\usbstor";
-                using (var svcKey = Registry.LocalMachine.OpenSubKey(svcPath, writable: true))
-                {
-                    if (svcKey != null)
-                    {
-                        int previousStart = svcKey.GetValue("Start") is int sv ? sv : 3; // 3 = Demand Start
-                        svcKey.SetValue("Start", ServiceDisabled, RegistryValueKind.DWord);
-                        success = true;
-                        Debug.WriteLine($"[UsbStorageBlocker] Disabled usbstor service (was Start={previousStart})");
-
-                        actionLog?.Add(new BlockActionRecord
-                        {
-                            ActionType = "ServiceStart",
-                            RegistryPath = svcPath,
-                            ServiceName = "usbstor",
-                            PreviousServiceStart = previousStart
-                        });
-                    }
-                }
-
-                // 3. Try to set ConfigFlags on USBSTOR\DISK&... instance if available
+                // 2. Try to set ConfigFlags on USBSTOR\DISK&... instance if available (per-device)
                 if (!string.IsNullOrEmpty(device.DeviceId))
                 {
                     // DeviceId may be like "USBSTOR\DISK&VEN_...&PROD_...&REV_...\...", normalize for registry

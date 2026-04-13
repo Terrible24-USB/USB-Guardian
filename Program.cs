@@ -69,6 +69,16 @@ namespace USBGuardian
         private const int SPDRP_DEVICE_DESC = 0x00000000;
         private const int SPDRP_MFG = 0x0000000B;
 
+        // ConfigFlags bits used when blocking a device per-instance
+        // (same semantics as UsbStorageBlocker / UsbBlockingManager constants)
+        private const int ConfigFlagDisabled  = 0x100;  // CONFIGFLAG_DISABLED
+        private const int ConfigFlagReinstall = 0x40;   // CONFIGFLAG_REINSTALL
+
+        // Race-window re-check delays (ms) applied after an immediate block to
+        // re-assert ConfigFlags in case Windows re-enables the device node.
+        private const int RaceWindowFirstRecheckMs  = 250;
+        private const int RaceWindowSecondRecheckMs = 750;
+
         private static readonly Guid GUID_DEVINTERFACE_USB_DEVICE =
             new Guid("A5DCBF10-6530-11D2-901F-00C04FB951ED");
 
@@ -411,6 +421,15 @@ namespace USBGuardian
 
             bool mightBeBuiltIn = BuiltInDeviceSafetyChecker.MightBeBuiltIn(device);
 
+            // WHITELISTING ENFORCEMENT: immediately block unapproved USB storage devices
+            // before the authorization dialog is shown so the device is disabled as soon
+            // as possible (minimising the brief window where it may be accessible).
+            // Devices that might be built-in are intentionally excluded from pre-blocking
+            // to avoid locking out keyboards / trackpads.
+            BlockedDeviceRecord? preBlockRecord = null;
+            if (!mightBeBuiltIn && UsbStorageBlocker.IsUsbStorageDevice(device))
+                preBlockRecord = ImmediateBlockForWhitelistEnforcement(device);
+
             using (var form = new Form())
             {
                 form.Text = "USB Guardian - Unknown Device Detected";
@@ -502,6 +521,16 @@ namespace USBGuardian
 
                 btnAllow.Click += (s, e) =>
                 {
+                    // If the device was immediately blocked, reverse the block before allowing it
+                    if (preBlockRecord != null)
+                    {
+                        try { unblockManager.UnblockDevice(preBlockRecord); }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine(
+                                $"[HandleUnknownDevice] Pre-block reversal failed: {ex.Message}");
+                        }
+                    }
                     if (chkRemember.Checked)
                     {
                         whitelist.Add(device);
@@ -516,14 +545,29 @@ namespace USBGuardian
 
                 btnBlock.Click += (s, e) =>
                 {
-                    BlockDevice(device);
-                    historyManager.LogEvent(device, DeviceEventType.Blocked, "User manually blocked device");
+                    // If not yet pre-blocked (e.g. non-storage or mightBeBuiltIn path), do full block now
+                    if (preBlockRecord == null)
+                        BlockDevice(device);
+                    historyManager.LogEvent(device, DeviceEventType.Blocked,
+                        preBlockRecord != null
+                            ? "User confirmed block of pre-blocked storage device"
+                            : "User manually blocked device");
                     form.DialogResult = DialogResult.No;
                     form.Close();
                 };
 
                 btnAllowAlways.Click += (s, e) =>
                 {
+                    // If the device was immediately blocked, reverse the block before allowing it
+                    if (preBlockRecord != null)
+                    {
+                        try { unblockManager.UnblockDevice(preBlockRecord); }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine(
+                                $"[HandleUnknownDevice] Pre-block reversal failed: {ex.Message}");
+                        }
+                    }
                     whitelist.Add(device);
                     SaveWhitelist();
                     historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User chose Allow & Add to Whitelist");
@@ -739,6 +783,217 @@ namespace USBGuardian
             {
                 Debug.WriteLine($"Registry key not found for {deviceLabel}: {instancePath}");
             }
+        }
+
+        /// <summary>
+        /// Re-applies ConfigFlags disable bits on <paramref name="instancePath"/> without
+        /// creating a new action record.  Used by the race-window re-check to re-assert
+        /// a block that Windows may have cleared during device enumeration.
+        /// </summary>
+        private static void SetDeviceConfigFlagsRaw(string instancePath, int flags)
+        {
+            try
+            {
+                using RegistryKey key = Registry.LocalMachine.OpenSubKey(instancePath, true);
+                if (key != null)
+                {
+                    int current = (int)(key.GetValue("ConfigFlags", 0) ?? 0);
+                    key.SetValue("ConfigFlags", current | flags, RegistryValueKind.DWord);
+                    Debug.WriteLine($"[WhitelistEnforcement] Race-window re-apply ConfigFlags 0x{flags:X} on {instancePath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[WhitelistEnforcement] SetDeviceConfigFlagsRaw failed on {instancePath}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Disables a device via WMI Win32_PnPEntity, targeting the exact device instance
+        /// first (by DeviceId / PnpDeviceId) and falling back to a VID/PID LIKE query.
+        /// All matching nodes that have not yet been seen are disabled.
+        /// </summary>
+        private static void DisableStorageDeviceViaWmi(DeviceFingerprint device,
+            List<BlockActionRecord> actions)
+        {
+            // Build queries from most-precise to least-precise
+            var queries = new List<string>();
+
+            // Exact match on USBSTOR\... DeviceId (WMI DeviceID, backslashes doubled for WQL)
+            if (!string.IsNullOrEmpty(device.DeviceId))
+            {
+                string escapedDeviceId = device.DeviceId.Replace("\\", "\\\\").Replace("'", "\\'");
+                queries.Add($"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{escapedDeviceId}'");
+            }
+
+            // Exact match on USB\VID_...\InstanceId
+            if (!string.IsNullOrEmpty(device.InstanceId) && device.InstanceId != "Unknown")
+            {
+                string usbPath       = $@"USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
+                string escapedUsbPath = usbPath.Replace("\\", "\\\\").Replace("'", "\\'");
+                queries.Add($"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{escapedUsbPath}'");
+            }
+
+            // Broad VID/PID LIKE fallback (catches composite device + storage child)
+            queries.Add($"SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_{device.Vid}&PID_{device.Pid}%'");
+
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string wql in queries)
+            {
+                try
+                {
+                    using var searcher = new ManagementObjectSearcher(wql);
+                    foreach (ManagementObject obj in searcher.Get())
+                    {
+                        if (obj == null) continue;
+                        string devId = obj["DeviceID"]?.ToString() ?? string.Empty;
+                        if (!seen.Add(devId)) continue;
+
+                        try
+                        {
+                            obj.InvokeMethod("Disable", null);
+                            actions.Add(new BlockActionRecord { ActionType = "WmiDisable" });
+                            Debug.WriteLine($"[WhitelistEnforcement] WMI disabled: {devId}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"[WhitelistEnforcement] WMI Disable failed for {devId}: {ex.Message}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[WhitelistEnforcement] WMI query failed ({wql}): {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Triggers a root-level cfgmgr32 re-enumeration so Windows drops the device
+        /// node that was just blocked via ConfigFlags, reducing the time the device
+        /// node is visible to the OS.
+        /// </summary>
+        private void TriggerRescanForBlock(string vidPid)
+        {
+            try
+            {
+                int cr = CM_Locate_DevNodeW(out uint rootInst, null, CM_LOCATE_DEVNODE_NORMAL_WL);
+                if (cr == CM_CR_SUCCESS)
+                {
+                    CM_Reenumerate_DevNode(rootInst, CM_REENUMERATE_NORMAL_WL);
+                    Debug.WriteLine($"[WhitelistEnforcement] Triggered cfgmgr32 rescan for {vidPid}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[WhitelistEnforcement] cfgmgr32 rescan failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Immediately blocks an unapproved USB storage device by applying per-device
+        /// ConfigFlags (disable bits), WMI Disable (exact instance), and a cfgmgr32
+        /// re-enumeration to drop the device node as early as possible.
+        ///
+        /// A race-window mitigation re-checks and re-applies the block at 250 ms and
+        /// 750 ms in case Windows re-enumerates the device node during driver binding.
+        ///
+        /// NOTE: This is a best-effort user-mode enforcement.  True zero-time mount
+        /// prevention requires a kernel filter driver.  If the device was briefly
+        /// enumerated before this method ran, a critical event is logged for audit.
+        ///
+        /// Returns the <see cref="BlockedDeviceRecord"/> that was persisted so the
+        /// caller can reverse the block if the user subsequently allows the device.
+        /// </summary>
+        private BlockedDeviceRecord ImmediateBlockForWhitelistEnforcement(DeviceFingerprint device)
+        {
+            string vidPid    = $"{device.Vid}:{device.Pid}";
+            string timestamp = DateTime.UtcNow.ToString("o");
+
+            guardianCore.EventLogger.LogCritical(0, "WhitelistEnforcement",
+                $"[{timestamp}] Unapproved USB storage device detected — applying immediate block. " +
+                $"Device: {device.Description ?? vidPid} ({vidPid}, InstanceId={device.InstanceId}). " +
+                "NOTE: device may have been briefly enumerated before this block was applied " +
+                "(user-mode enforcement limitation — a kernel filter driver is required for " +
+                "guaranteed zero-time mount prevention).",
+                vidPid);
+
+            Debug.WriteLine($"[WhitelistEnforcement] Immediately blocking unapproved storage {vidPid} at {timestamp}");
+
+            var actions = new List<BlockActionRecord>();
+
+            // 1. Per-device ConfigFlags on the USB instance key
+            string usbInstancePath =
+                $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
+            SetDeviceConfigFlagsRecorded(usbInstancePath, ConfigFlagDisabled | ConfigFlagReinstall,
+                "unapproved USB storage (whitelist enforcement)", actions);
+
+            // 2. Per-device ConfigFlags on the USBSTOR child key (if available)
+            if (!string.IsNullOrEmpty(device.DeviceId) &&
+                device.DeviceId.StartsWith("USBSTOR", StringComparison.OrdinalIgnoreCase))
+            {
+                string usbStorPath =
+                    $@"SYSTEM\CurrentControlSet\Enum\{device.DeviceId.Replace('/', '\\')}";
+                SetDeviceConfigFlagsRecorded(usbStorPath, ConfigFlagDisabled | ConfigFlagReinstall,
+                    "unapproved USBSTOR child (whitelist enforcement)", actions);
+            }
+
+            // 3. WMI Disable by exact device ID (most precise targeting)
+            DisableStorageDeviceViaWmi(device, actions);
+
+            // 4. cfgmgr32 rescan — ask Windows to drop the device node now
+            TriggerRescanForBlock(vidPid);
+
+            // Persist record so the caller can call UnblockDevice if the user allows the device
+            var record = new BlockedDeviceRecord
+            {
+                Vid          = device.Vid          ?? string.Empty,
+                Pid          = device.Pid          ?? string.Empty,
+                InstanceId   = device.InstanceId   ?? string.Empty,
+                SerialNumber = device.SerialNumber ?? string.Empty,
+                Description  = device.Description  ?? string.Empty,
+                PnpDeviceId  = device.DeviceId     ?? string.Empty,
+                BlockReason  =
+                    $"Whitelist enforcement: unapproved storage device blocked at detection ({timestamp})",
+                Actions = actions
+            };
+            blockedDeviceStore.AddOrUpdate(record);
+
+            // 5. Race-window mitigation: re-check and re-assert block in background
+            Task.Run(async () =>
+            {
+                foreach (int delayMs in new[] { RaceWindowFirstRecheckMs, RaceWindowSecondRecheckMs })
+                {
+                    await Task.Delay(delayMs).ConfigureAwait(false);
+                    try
+                    {
+                        if (!guardianCore.BlockingManager.IsDeviceBlocked(
+                                device.Vid, device.Pid, device.InstanceId))
+                        {
+                            guardianCore.EventLogger.LogCritical(0, "WhitelistEnforcement",
+                                $"Race window: re-applying block for {vidPid} after {delayMs} ms — " +
+                                "Windows re-enabled the device node.",
+                                vidPid);
+                            Debug.WriteLine(
+                                $"[WhitelistEnforcement] Race-window re-apply at {delayMs} ms for {vidPid}");
+
+                            SetDeviceConfigFlagsRaw(usbInstancePath, ConfigFlagDisabled | ConfigFlagReinstall);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine(
+                            $"[WhitelistEnforcement] Race-window re-check failed at {delayMs} ms: {ex.Message}");
+                    }
+                }
+            });
+
+            ShowBalloonTip(
+                "⚠ Unapproved Storage Device Blocked",
+                $"USB storage device blocked pending authorization: {device.Description ?? vidPid}");
+
+            return record;
         }
 
         private void LogUnknownDevice(DeviceFingerprint device)
@@ -1065,9 +1320,18 @@ namespace USBGuardian
         private static extern bool SetupDiDestroyDeviceInfoList(
             IntPtr DeviceInfoSet);
 
-        // =============================
-        // DEVICE IDENTIFIER CLASS
-        // =============================
+        // cfgmgr32 — used to trigger device re-enumeration after immediate block
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+        private static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string? pDeviceID, uint ulFlags);
+
+        [DllImport("cfgmgr32.dll")]
+        private static extern int CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
+
+        private const int  CM_CR_SUCCESS               = 0;
+        private const uint CM_LOCATE_DEVNODE_NORMAL_WL = 0;
+        private const uint CM_REENUMERATE_NORMAL_WL    = 0;
+
+
         public class DeviceIdentifier
         {
             /// <summary>

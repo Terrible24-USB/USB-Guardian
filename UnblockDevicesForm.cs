@@ -377,7 +377,7 @@ namespace USBGuardian
 
                 // If any action could not restore the USBSTOR service (no recorded previous value),
                 // show a targeted recovery dialog with manual restoration instructions.
-                var recoveryItems = results
+                var recoveryItems = result.Messages
                     .Where(r => r.StartsWith("RECOVERY_REQUIRED:", StringComparison.Ordinal))
                     .ToList();
                 if (recoveryItems.Any())
