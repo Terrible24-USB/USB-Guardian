@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Linq;
 using System.Security.Principal;
 using System.Windows.Forms;
 
@@ -264,6 +265,35 @@ namespace USBGuardian
                 }
             }
 
+            // Safety warning: if unblocking will restore the USBSTOR service, warn the user
+            // that this affects ALL USB storage devices on the system (not just this one).
+            bool restoresUsbStorService = record.Actions.Any(a =>
+                a.ActionType == "ServiceStart" &&
+                string.Equals(a.ServiceName, "usbstor", StringComparison.OrdinalIgnoreCase));
+
+            if (restoresUsbStorService)
+            {
+                var storageWarn = MessageBox.Show(
+                    "⚠  GLOBAL USB STORAGE WARNING  ⚠\n\n" +
+                    "This device was blocked by disabling the USB Mass Storage driver (USBSTOR " +
+                    "service) system-wide.\n\n" +
+                    "Unblocking will RESTORE the USBSTOR service, re-enabling USB mass storage " +
+                    "for ALL USB storage devices on this computer — not only this device.\n\n" +
+                    "A system re-enumeration will be triggered automatically. If the device still " +
+                    "does not appear, unplug and replug it.\n\n" +
+                    "Continue?",
+                    "⚠ Global USB Storage Impact",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2);
+
+                if (storageWarn != DialogResult.Yes)
+                {
+                    _lblStatus.Text = "Unblock cancelled by user.";
+                    return;
+                }
+            }
+
             // Explicit confirmation
             string dryNote = _unblockManager.DryRun ? "\n\n(DRY RUN: no actual changes will be made)" : string.Empty;
             var confirm = MessageBox.Show(
@@ -291,6 +321,29 @@ namespace USBGuardian
                     title,
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
+
+                // If any action could not restore the USBSTOR service (no recorded previous value),
+                // show a targeted recovery dialog with manual restoration instructions.
+                var recoveryItems = results
+                    .Where(r => r.StartsWith("RECOVERY_REQUIRED:", StringComparison.Ordinal))
+                    .ToList();
+                if (recoveryItems.Any())
+                {
+                    MessageBox.Show(
+                        "⚠  MANUAL RESTORATION REQUIRED  ⚠\n\n" +
+                        "USB Guardian could not automatically restore the USB Mass Storage driver " +
+                        "because no previous Start value was recorded at block time.\n\n" +
+                        "USB storage will remain unavailable until you restore it manually:\n\n" +
+                        "  1. Open Registry Editor as Administrator  (Win+R → regedit → OK)\n" +
+                        @"  2. Navigate to:  HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\usbstor" + "\n" +
+                        "  3. Double-click  Start  and set the value to  3  (Demand Start — Windows default)\n" +
+                        "  4. Click OK and close Registry Editor\n" +
+                        "  5. Restart your computer, or unplug and replug the USB device\n\n" +
+                        "Value meaning: 3 = Demand Start (Windows default)   4 = Disabled",
+                        "⚠ Manual Restoration Required",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
 
                 PopulateList();
                 _lblStatus.Text = _unblockManager.DryRun

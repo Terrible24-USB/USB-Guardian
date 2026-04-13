@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Management;
+using System.Runtime.InteropServices;
 using Microsoft.Win32;
 
 namespace USBGuardian
@@ -21,6 +23,17 @@ namespace USBGuardian
         // ConfigFlags bits added by USB Guardian at block time
         private const int ConfigFlagDisabled = 0x100;
         private const int ConfigFlagReinstall = 0x40;
+
+        // CfgMgr32 P/Invoke for device re-enumeration
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+        private static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string? pDeviceID, uint ulFlags);
+
+        [DllImport("cfgmgr32.dll")]
+        private static extern int CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
+
+        private const int  CR_SUCCESS                = 0;
+        private const uint CM_LOCATE_DEVNODE_NORMAL  = 0;
+        private const uint CM_REENUMERATE_NORMAL     = 0;
 
         private readonly BlockedDeviceStore _store;
         private readonly SecurityEventLogger _logger;
@@ -59,7 +72,25 @@ namespace USBGuardian
 
             bool wmiDoneExplicitly = false;
 
-            foreach (var action in record.Actions)
+            // Sort actions so critical restorations happen in the correct order:
+            //   0 – ServiceStart for "usbstor" (restore the global storage driver first)
+            //   1 – other ServiceStart actions
+            //   2 – ConfigFlags (per-device registry)
+            //   3 – WmiDisable (re-enable the device node last)
+            var orderedActions = record.Actions
+                .OrderBy(a =>
+                {
+                    if (a.ActionType == "ServiceStart" &&
+                        string.Equals(a.ServiceName, "usbstor", StringComparison.OrdinalIgnoreCase))
+                        return 0;
+                    if (a.ActionType == "ServiceStart") return 1;
+                    if (a.ActionType == "ConfigFlags")  return 2;
+                    if (a.ActionType == "WmiDisable")   return 3;
+                    return 4;
+                })
+                .ToList();
+
+            foreach (var action in orderedActions)
             {
                 try
                 {
@@ -102,6 +133,20 @@ namespace USBGuardian
             if (!DryRun)
                 _store.Remove(record.Vid, record.Pid, record.InstanceId);
 
+            // Trigger a device re-enumeration so Windows can rediscover the restored device
+            // without requiring a manual unplug/replug in most cases.
+            try
+            {
+                string rescanResult = TriggerDeviceRescan();
+                results.Add($"Re-enumeration: {rescanResult}");
+                _logger.LogInfo(0, "DeviceRescan", rescanResult, vidPid);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[UnblockManager] Device rescan failed: {ex.Message}");
+                results.Add("Re-enumeration: not available — unplug and replug the device if it does not appear");
+            }
+
             return results;
         }
 
@@ -143,7 +188,18 @@ namespace USBGuardian
                 return "Skipped: no service name recorded";
 
             if (action.PreviousServiceStart == null)
+            {
+                bool isUsbStor = string.Equals(action.ServiceName, "usbstor",
+                    StringComparison.OrdinalIgnoreCase);
+                if (isUsbStor)
+                    // Return a sentinel that the UI layer can detect to show a recovery prompt.
+                    // Do NOT guess a default — the caller must guide the user to restore manually.
+                    return "RECOVERY_REQUIRED: No previous Start value was recorded for the USBSTOR " +
+                           "service. USB storage remains disabled. Manual restoration required: " +
+                           @"HKLM\SYSTEM\CurrentControlSet\Services\usbstor → Start = 3 (Windows default)";
+
                 return $"Skipped: no previous Start value was recorded for service '{action.ServiceName}'";
+            }
 
             if (DryRun)
                 return $"[DRY RUN] Would restore service '{action.ServiceName}' " +
@@ -167,13 +223,32 @@ namespace USBGuardian
 
             try
             {
-                string query = $"SELECT * FROM Win32_PnPEntity " +
-                               $"WHERE DeviceID LIKE '%VID_{record.Vid}&PID_{record.Pid}%'";
+                // Try InstanceId-specific match first (more precise — avoids enabling the wrong
+                // composite interface when multiple devices share the same VID/PID).
+                if (!string.IsNullOrEmpty(record.InstanceId))
+                {
+                    string safeInstanceId = SanitizeWqlLike(record.InstanceId);
+                    string instanceQuery = "SELECT * FROM Win32_PnPEntity " +
+                                           $"WHERE DeviceID LIKE '%{safeInstanceId}%'";
+                    using var instanceSearcher = new ManagementObjectSearcher(instanceQuery);
+                    foreach (ManagementObject obj in instanceSearcher.Get())
+                    {
+                        obj.InvokeMethod("Enable", null);
+                        return $"Enabled via WMI (InstanceId match): {obj["DeviceID"]}";
+                    }
+                }
+
+                // Fall back to VID/PID wildcard (catches all interfaces of this device).
+                // Validate Vid/Pid to contain only expected hex characters before embedding.
+                string safeVid = SanitizeWqlLike(record.Vid ?? string.Empty);
+                string safePid = SanitizeWqlLike(record.Pid ?? string.Empty);
+                string query = "SELECT * FROM Win32_PnPEntity " +
+                               $"WHERE DeviceID LIKE '%VID_{safeVid}&PID_{safePid}%'";
                 using var searcher = new ManagementObjectSearcher(query);
                 foreach (ManagementObject obj in searcher.Get())
                 {
                     obj.InvokeMethod("Enable", null);
-                    return $"Enabled via WMI: {obj["DeviceID"]}";
+                    return $"Enabled via WMI (VID/PID match): {obj["DeviceID"]}";
                 }
                 return "Device not found via WMI (may already be active or physically absent)";
             }
@@ -181,6 +256,54 @@ namespace USBGuardian
             {
                 return $"WMI enable failed: {ex.Message}";
             }
+        }
+
+        /// <summary>
+        /// Triggers a system-wide device re-enumeration using the CfgMgr32 API so that
+        /// Windows rediscovers hardware whose block was just lifted without requiring
+        /// the user to physically unplug and replug the device.
+        /// </summary>
+        private string TriggerDeviceRescan()
+        {
+            if (DryRun)
+                return "[DRY RUN] Would trigger device re-enumeration scan";
+
+            try
+            {
+                // Locate the root devnode (null device ID = root) then reenumerate its children.
+                int cr = CM_Locate_DevNodeW(out uint devInst, null, CM_LOCATE_DEVNODE_NORMAL);
+                if (cr == CR_SUCCESS)
+                {
+                    CM_Reenumerate_DevNode(devInst, CM_REENUMERATE_NORMAL);
+                    return "Device re-enumeration scan triggered — Windows will rediscover restored devices";
+                }
+                return $"Device rescan: CM_Locate_DevNodeW returned code {cr} — unplug and replug the device if it does not appear";
+            }
+            catch (Exception ex)
+            {
+                return $"Device rescan not available: {ex.Message} — unplug and replug the device if it does not appear";
+            }
+        }
+
+        /// <summary>
+        /// Escapes WQL LIKE pattern metacharacters (%, _, [) in <paramref name="input"/>
+        /// so that the string can be safely embedded in a WQL LIKE clause without
+        /// inadvertently matching unintended device IDs.
+        /// </summary>
+        private static string SanitizeWqlLike(string input)
+        {
+            var sb = new System.Text.StringBuilder(input.Length * 2);
+            foreach (char c in input)
+            {
+                switch (c)
+                {
+                    case '%': sb.Append("[%]"); break;
+                    case '_': sb.Append("[_]"); break;
+                    case '[': sb.Append("[[]"); break;
+                    default:  sb.Append(c);    break;
+                }
+            }
+            return sb.ToString();
         }
     }
 }
