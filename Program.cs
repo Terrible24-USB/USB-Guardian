@@ -69,6 +69,16 @@ namespace USBGuardian
         private const int SPDRP_DEVICE_DESC = 0x00000000;
         private const int SPDRP_MFG = 0x0000000B;
 
+        // ConfigFlags bits used when blocking a device per-instance
+        // (same semantics as UsbStorageBlocker / UsbBlockingManager constants)
+        private const int ConfigFlagDisabled  = 0x100;  // CONFIGFLAG_DISABLED
+        private const int ConfigFlagReinstall = 0x40;   // CONFIGFLAG_REINSTALL
+
+        // Race-window re-check delays (ms) applied after an immediate block to
+        // re-assert ConfigFlags in case Windows re-enables the device node.
+        private const int RaceWindowFirstRecheckMs  = 250;
+        private const int RaceWindowSecondRecheckMs = 750;
+
         private static readonly Guid GUID_DEVINTERFACE_USB_DEVICE =
             new Guid("A5DCBF10-6530-11D2-901F-00C04FB951ED");
 
@@ -812,16 +822,16 @@ namespace USBGuardian
             // Exact match on USBSTOR\... DeviceId (WMI DeviceID, backslashes doubled for WQL)
             if (!string.IsNullOrEmpty(device.DeviceId))
             {
-                string escaped = device.DeviceId.Replace("\\", "\\\\").Replace("'", "\\'");
-                queries.Add($"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{escaped}'");
+                string escapedDeviceId = device.DeviceId.Replace("\\", "\\\\").Replace("'", "\\'");
+                queries.Add($"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{escapedDeviceId}'");
             }
 
             // Exact match on USB\VID_...\InstanceId
             if (!string.IsNullOrEmpty(device.InstanceId) && device.InstanceId != "Unknown")
             {
-                string usbPath = $@"USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
-                string escaped = usbPath.Replace("\\", "\\\\").Replace("'", "\\'");
-                queries.Add($"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{escaped}'");
+                string usbPath       = $@"USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
+                string escapedUsbPath = usbPath.Replace("\\", "\\\\").Replace("'", "\\'");
+                queries.Add($"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{escapedUsbPath}'");
             }
 
             // Broad VID/PID LIKE fallback (catches composite device + storage child)
@@ -916,7 +926,7 @@ namespace USBGuardian
             // 1. Per-device ConfigFlags on the USB instance key
             string usbInstancePath =
                 $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
-            SetDeviceConfigFlagsRecorded(usbInstancePath, 0x100 | 0x40,
+            SetDeviceConfigFlagsRecorded(usbInstancePath, ConfigFlagDisabled | ConfigFlagReinstall,
                 "unapproved USB storage (whitelist enforcement)", actions);
 
             // 2. Per-device ConfigFlags on the USBSTOR child key (if available)
@@ -925,7 +935,7 @@ namespace USBGuardian
             {
                 string usbStorPath =
                     $@"SYSTEM\CurrentControlSet\Enum\{device.DeviceId.Replace('/', '\\')}";
-                SetDeviceConfigFlagsRecorded(usbStorPath, 0x100 | 0x40,
+                SetDeviceConfigFlagsRecorded(usbStorPath, ConfigFlagDisabled | ConfigFlagReinstall,
                     "unapproved USBSTOR child (whitelist enforcement)", actions);
             }
 
@@ -953,7 +963,7 @@ namespace USBGuardian
             // 5. Race-window mitigation: re-check and re-assert block in background
             Task.Run(async () =>
             {
-                foreach (int delayMs in new[] { 250, 750 })
+                foreach (int delayMs in new[] { RaceWindowFirstRecheckMs, RaceWindowSecondRecheckMs })
                 {
                     await Task.Delay(delayMs).ConfigureAwait(false);
                     try
@@ -968,7 +978,7 @@ namespace USBGuardian
                             Debug.WriteLine(
                                 $"[WhitelistEnforcement] Race-window re-apply at {delayMs} ms for {vidPid}");
 
-                            SetDeviceConfigFlagsRaw(usbInstancePath, 0x100 | 0x40);
+                            SetDeviceConfigFlagsRaw(usbInstancePath, ConfigFlagDisabled | ConfigFlagReinstall);
                         }
                     }
                     catch (Exception ex)
