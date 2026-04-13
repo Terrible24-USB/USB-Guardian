@@ -25,9 +25,9 @@ namespace USBGuardian
         private readonly List<InputDeviceMonitor.BlockedInputDevice> _blockedDevices;
         private readonly bool _isElevated;
 
-        private Label  _lblResult     = null!;
-        private Button _btnBackup     = null!;
-        private Button _btnDenyOnly   = null!;
+        private Label  _lblResult   = new Label();
+        private Button _btnBackup   = new Button();
+        private Button _btnDenyOnly = new Button();
 
         public EmergencyRecoveryForm(
             EmergencyRecoveryManager manager,

@@ -155,7 +155,6 @@ namespace USBGuardian
                     return "Policy restrictions key not found — policies may already be removed.";
 
                 key.DeleteValue("DenyUnspecified", throwOnMissingValue: false);
-                key.DeleteValue("AllowDeviceIDs", throwOnMissingValue: false);
 
                 // Delete the AllowDeviceIDs subkey entirely
                 try { key.DeleteSubKeyTree("AllowDeviceIDs", throwOnMissingSubKey: false); }
