@@ -110,6 +110,9 @@ namespace USBGuardian
             // Verify all critical safety systems are working before accepting USB events
             RunStartupSafetyTests();
 
+            // Check for legacy USBSTOR block left by older versions and warn the user
+            CheckUsbStorStartupWarning();
+
             Debug.WriteLine("USB Guardian Started - Monitoring for USB devices...");
         }
 
@@ -128,12 +131,32 @@ namespace USBGuardian
                 form.ShowDialog();
             };
 
+            // "Restore USB Storage" item — visible only when a legacy USBSTOR block is detected.
+            // Its visibility is refreshed on every tray menu open.
+            var itemRestoreUsbStor = new ToolStripMenuItem("⚠ Restore USB Storage…")
+            {
+                ForeColor = Color.DarkRed,
+                Font = new Font(SystemFonts.MenuFont, FontStyle.Bold)
+            };
+            itemRestoreUsbStor.Click += (_, _) =>
+            {
+                using var form = new LegacyStorageRecoveryForm(unblockManager);
+                form.ShowDialog();
+            };
+
             var itemExit = new ToolStripMenuItem("Exit USB Guardian");
             itemExit.Click += (_, _) => Application.Exit();
 
             menu.Items.Add(itemUnblock);
+            menu.Items.Add(itemRestoreUsbStor);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(itemExit);
+
+            // Refresh the "Restore USB Storage" visibility each time the menu opens
+            menu.Opening += (_, _) =>
+            {
+                itemRestoreUsbStor.Visible = unblockManager.IsLegacyUsbStorBlock();
+            };
 
             trayIcon = new NotifyIcon
             {
@@ -148,6 +171,38 @@ namespace USBGuardian
                 using var form = new UnblockDevicesForm(blockedDeviceStore, unblockManager);
                 form.ShowDialog();
             };
+        }
+
+        /// <summary>
+        /// Checks whether the USBSTOR service is globally disabled without a recorded
+        /// previous value (legacy block).  If so, shows a tray balloon warning and logs
+        /// a critical event so the user knows they should use "Restore USB Storage".
+        /// </summary>
+        private void CheckUsbStorStartupWarning()
+        {
+            try
+            {
+                if (!unblockManager.IsLegacyUsbStorBlock()) return;
+
+                guardianCore.EventLogger.LogCritical(0, "StartupWarning",
+                    "USBSTOR service is disabled (Start=4) with no recorded previous value. " +
+                    "USB storage devices will not work until restored. " +
+                    "Use 'Restore USB Storage' from the tray menu.",
+                    null);
+
+                Debug.WriteLine("[StartupWarning] Legacy USBSTOR block detected — showing balloon tip");
+
+                trayIcon.ShowBalloonTip(
+                    8000,
+                    "⚠ USB Storage is Disabled",
+                    "USB storage was globally disabled by an older version of USB Guardian.\r\n" +
+                    "Right-click the tray icon and choose \"Restore USB Storage\" to recover.",
+                    ToolTipIcon.Warning);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[StartupWarning] Check failed: {ex.Message}");
+            }
         }
 
         private void RegisterForUsbNotifications()

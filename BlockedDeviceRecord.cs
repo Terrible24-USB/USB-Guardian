@@ -25,6 +25,13 @@ namespace USBGuardian
         public string SerialNumber { get; set; } = string.Empty;
         public string Description { get; set; } = string.Empty;
 
+        /// <summary>
+        /// Full PnP Device ID as reported by WMI Win32_PnPEntity (DeviceID field),
+        /// e.g. "USB\VID_1234&amp;PID_5678\ABCDEF01".
+        /// Stored at block time to allow precise WMI re-enable targeting during unblock.
+        /// </summary>
+        public string PnpDeviceId { get; set; } = string.Empty;
+
         // --- Block event metadata ---
 
         /// <summary>UTC time at which the device was blocked.</summary>

@@ -103,6 +103,7 @@ namespace USBGuardian
                     InstanceId = device.InstanceId ?? string.Empty,
                     SerialNumber = device.SerialNumber ?? string.Empty,
                     Description = device.Description ?? string.Empty,
+                    PnpDeviceId = device.DeviceId ?? string.Empty,
                     BlockReason = "USB Mass Storage blocked",
                     Actions = actions
                 });
