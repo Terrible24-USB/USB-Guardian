@@ -960,6 +960,69 @@ namespace USBGuardian
             {
                 Debug.WriteLine("[StartupTest] All 6 startup safety tests PASSED.");
             }
+
+            // Non-fatal check: detect an orphaned USBSTOR disable that USB Guardian did not record.
+            // This can happen if a previous version blocked without recording, or if the record was lost.
+            CheckOrphanedUsbStorDisable();
+        }
+
+        /// <summary>
+        /// Checks whether the USBSTOR service is currently disabled (Start=4) without a
+        /// corresponding <see cref="BlockedDeviceRecord"/> that explains it.
+        /// If so, surfaces a tray balloon warning so the user is not silently bricked.
+        /// This check is non-fatal and does not prevent the application from starting.
+        /// </summary>
+        private void CheckOrphanedUsbStorDisable()
+        {
+            try
+            {
+                using var svcKey = Registry.LocalMachine.OpenSubKey(
+                    @"SYSTEM\CurrentControlSet\Services\usbstor");
+                if (svcKey == null) return;
+
+                int startValue = svcKey.GetValue("Start") is int sv ? sv : -1;
+                if (startValue != 4) return; // USBSTOR is not disabled — nothing to warn about
+
+                // USBSTOR is disabled: check whether any blocked-device record explains it
+                bool guardianCausedIt = blockedDeviceStore
+                    .GetAll()
+                    .Any(record => record.Actions.Any(a =>
+                        a.ActionType == "ServiceStart" &&
+                        string.Equals(a.ServiceName, "usbstor", StringComparison.OrdinalIgnoreCase)));
+
+                if (!guardianCausedIt)
+                {
+                    const string warning =
+                        "⚠ CRITICAL: The USB Mass Storage driver (USBSTOR) is currently DISABLED " +
+                        "(registry Start=4), but USB Guardian has no record of disabling it.\n\n" +
+                        "USB storage devices will not work until the service is restored.\n\n" +
+                        "Open the 'Unblock Devices' window from the tray icon to review blocked records, " +
+                        "or restore manually:\n" +
+                        @"  HKLM\SYSTEM\CurrentControlSet\Services\usbstor → Start = 3";
+
+                    Debug.WriteLine($"[StartupCheck] CRITICAL: Orphaned USBSTOR disable detected!");
+                    Debug.WriteLine(warning);
+
+                    guardianCore?.EventLogger?.LogCritical(
+                        0, "OrphanedUsbStorDisable", warning, "usbstor");
+
+                    // Surface a prominent tray balloon notification
+                    trayIcon?.ShowBalloonTip(
+                        30_000,
+                        "⚠ USB Guardian — Warning",
+                        "USB storage is GLOBALLY DISABLED and no block record was found. " +
+                        "Open 'Unblock Devices' from the tray icon to investigate or restore manually.",
+                        ToolTipIcon.Error);
+                }
+                else
+                {
+                    Debug.WriteLine("[StartupCheck] USBSTOR Start=4 is covered by a blocked-device record — OK.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[StartupCheck] USBSTOR orphan check error: {ex.Message}");
+            }
         }
 
         // =============================
