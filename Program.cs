@@ -90,6 +90,7 @@ namespace USBGuardian
         private BlockedDeviceStore blockedDeviceStore;
         private UnblockManager unblockManager;
         private NotifyIcon trayIcon;
+        private EmergencyRecoveryManager emergencyRecoveryManager;
 
         public USBMessageWindow()
         {
@@ -111,6 +112,12 @@ namespace USBGuardian
             // Wire the store into the blocking managers so every block is recorded
             guardianCore.BlockingManager.Store = blockedDeviceStore;
 
+            // Initialize emergency recovery manager (shared backup manager, respects DryRun)
+            emergencyRecoveryManager = new EmergencyRecoveryManager(
+                guardianCore.EventLogger,
+                new AllowedDevicesBackupManager(),
+                dryRun: unblockManager.DryRun);
+
             // Set up system tray icon with context menu
             SetupTrayIcon();
 
@@ -122,6 +129,9 @@ namespace USBGuardian
 
             // Check for legacy USBSTOR block left by older versions and warn the user
             CheckUsbStorStartupWarning();
+
+            // Check for HID input device lockout and show emergency recovery UI if needed
+            emergencyRecoveryManager.DetectAndShowRecoveryIfNeeded();
 
             Debug.WriteLine("USB Guardian Started - Monitoring for USB devices...");
         }
@@ -157,8 +167,17 @@ namespace USBGuardian
             var itemExit = new ToolStripMenuItem("Exit USB Guardian");
             itemExit.Click += (_, _) => Application.Exit();
 
+            // Emergency recovery item — always visible so users can access it even without a lockout
+            var itemEmergency = new ToolStripMenuItem("🚨 Emergency Input Device Recovery…")
+            {
+                ForeColor = Color.DarkRed,
+                Font = new Font(SystemFonts.MenuFont, FontStyle.Bold)
+            };
+            itemEmergency.Click += (_, _) => emergencyRecoveryManager.ShowRecoveryUI();
+
             menu.Items.Add(itemUnblock);
             menu.Items.Add(itemRestoreUsbStor);
+            menu.Items.Add(itemEmergency);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(itemExit);
 
