@@ -164,6 +164,11 @@ namespace USBGuardian
         {
             string json = JsonSerializer.Serialize(backup, JsonOptions);
             string tempPath = _filePath + ".tmp";
+
+            string? dir = Path.GetDirectoryName(tempPath);
+            if (dir != null && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
             File.WriteAllText(tempPath, json);
             File.Move(tempPath, _filePath, overwrite: true);
         }
