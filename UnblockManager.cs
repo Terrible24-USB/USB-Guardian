@@ -55,17 +55,6 @@ namespace USBGuardian
         private readonly BlockedDeviceStore _store;
         private readonly SecurityEventLogger _logger;
 
-        // ---- cfgmgr32 P/Invoke for best-effort device re-enumeration ----
-        [DllImport("CfgMgr32.dll", CharSet = CharSet.Unicode, SetLastError = false)]
-        private static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string? pDeviceID, uint ulFlags);
-
-        [DllImport("CfgMgr32.dll", SetLastError = false)]
-        private static extern int CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
-
-        private const uint CM_LOCATE_DEVNODE_NORMAL = 0x00000000;
-        private const uint CM_REENUMERATE_NORMAL    = 0x00000000;
-        private const int  CR_SUCCESS               = 0x00000000;
-
         /// <summary>
         /// When true, all actions are logged but no system changes are made.
         /// Activated by the USB_GUARDIAN_DRY_RUN=1 environment variable, or
@@ -245,13 +234,15 @@ namespace USBGuardian
                     results.Add($"Error on {path}: {ex.Message}");
                     Debug.WriteLine($"[UnblockManager.ClearLegacyConfigFlags] {ex.Message}");
                 }
+            }
+
             // Trigger a device re-enumeration so Windows can rediscover the restored device
             // without requiring a manual unplug/replug in most cases.
             try
             {
                 string rescanResult = TriggerDeviceRescan();
                 results.Add($"Re-enumeration: {rescanResult}");
-                _logger.LogInfo(0, "DeviceRescan", rescanResult, vidPid);
+                _logger.LogInfo(0, "DeviceRescan", rescanResult, $"{record.Vid}:{record.Pid}");
             }
             catch (Exception ex)
             {
@@ -455,32 +446,6 @@ namespace USBGuardian
                     {
                         Debug.WriteLine($"[UnblockManager] WMI query failed: {ex.Message}");
                     }
-                // Try InstanceId-specific match first (more precise — avoids enabling the wrong
-                // composite interface when multiple devices share the same VID/PID).
-                if (!string.IsNullOrEmpty(record.InstanceId))
-                {
-                    string safeInstanceId = SanitizeWqlLike(record.InstanceId);
-                    string instanceQuery = "SELECT * FROM Win32_PnPEntity " +
-                                           $"WHERE DeviceID LIKE '%{safeInstanceId}%'";
-                    using var instanceSearcher = new ManagementObjectSearcher(instanceQuery);
-                    foreach (ManagementObject obj in instanceSearcher.Get())
-                    {
-                        obj.InvokeMethod("Enable", null);
-                        return $"Enabled via WMI (InstanceId match): {obj["DeviceID"]}";
-                    }
-                }
-
-                // Fall back to VID/PID wildcard (catches all interfaces of this device).
-                // Validate Vid/Pid to contain only expected hex characters before embedding.
-                string safeVid = SanitizeWqlLike(record.Vid ?? string.Empty);
-                string safePid = SanitizeWqlLike(record.Pid ?? string.Empty);
-                string query = "SELECT * FROM Win32_PnPEntity " +
-                               $"WHERE DeviceID LIKE '%VID_{safeVid}&PID_{safePid}%'";
-                using var searcher = new ManagementObjectSearcher(query);
-                foreach (ManagementObject obj in searcher.Get())
-                {
-                    obj.InvokeMethod("Enable", null);
-                    return $"Enabled via WMI (VID/PID match): {obj["DeviceID"]}";
                 }
 
                 if (enabled.Count == 0)
@@ -567,6 +532,8 @@ namespace USBGuardian
 
         private static string WmiEscape(string value)
             => value.Replace("\\", "\\\\").Replace("'", "\\'");
+
+        /// <summary>
         /// Triggers a system-wide device re-enumeration using the CfgMgr32 API so that
         /// Windows rediscovers hardware whose block was just lifted without requiring
         /// the user to physically unplug and replug the device.
