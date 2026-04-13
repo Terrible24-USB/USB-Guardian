@@ -29,6 +29,7 @@ namespace USBGuardian
         private readonly UsbBlockingManager _blockingManager;
 
         public SecurityEventLogger EventLogger => _eventLogger;
+        public UsbBlockingManager BlockingManager => _blockingManager;
 
         public UsbGuardianCore()
         {

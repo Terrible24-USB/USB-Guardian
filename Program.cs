@@ -77,6 +77,9 @@ namespace USBGuardian
         private List<DeviceFingerprint> whitelist;
         private DeviceHistoryManager historyManager;
         private UsbGuardianCore guardianCore;
+        private BlockedDeviceStore blockedDeviceStore;
+        private UnblockManager unblockManager;
+        private NotifyIcon trayIcon;
 
         public USBMessageWindow()
         {
@@ -91,6 +94,16 @@ namespace USBGuardian
             guardianCore = new UsbGuardianCore();
             _ = guardianCore.InitializeAsync();
 
+            // Initialize the blocked-device store and unblock manager
+            blockedDeviceStore = new BlockedDeviceStore();
+            unblockManager = new UnblockManager(blockedDeviceStore, guardianCore.EventLogger);
+
+            // Wire the store into the blocking managers so every block is recorded
+            guardianCore.BlockingManager.Store = blockedDeviceStore;
+
+            // Set up system tray icon with context menu
+            SetupTrayIcon();
+
             // Auto-whitelist built-in devices so they are never shown in the unknown-device dialog
             AutoWhitelistBuiltInDevices();
 
@@ -98,6 +111,43 @@ namespace USBGuardian
             RunStartupSafetyTests();
 
             Debug.WriteLine("USB Guardian Started - Monitoring for USB devices...");
+        }
+
+        /// <summary>
+        /// Creates a system-tray icon with a context menu that provides access to
+        /// the Unblock Devices form and an Exit option.
+        /// </summary>
+        private void SetupTrayIcon()
+        {
+            var menu = new ContextMenuStrip();
+
+            var itemUnblock = new ToolStripMenuItem("🔓 Unblock Devices…");
+            itemUnblock.Click += (_, _) =>
+            {
+                using var form = new UnblockDevicesForm(blockedDeviceStore, unblockManager);
+                form.ShowDialog();
+            };
+
+            var itemExit = new ToolStripMenuItem("Exit USB Guardian");
+            itemExit.Click += (_, _) => Application.Exit();
+
+            menu.Items.Add(itemUnblock);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(itemExit);
+
+            trayIcon = new NotifyIcon
+            {
+                Icon = SystemIcons.Shield,
+                Text = "USB Guardian",
+                ContextMenuStrip = menu,
+                Visible = true
+            };
+
+            trayIcon.DoubleClick += (_, _) =>
+            {
+                using var form = new UnblockDevicesForm(blockedDeviceStore, unblockManager);
+                form.ShowDialog();
+            };
         }
 
         private void RegisterForUsbNotifications()
@@ -517,7 +567,10 @@ namespace USBGuardian
                 {
                     // USB Mass Storage: eject mounted volumes and set registry block flags
                     Debug.WriteLine("🔒 Storage device detected — using UsbStorageBlocker");
-                    var storageBlocker = new UsbStorageBlocker(guardianCore.EventLogger);
+                    var storageBlocker = new UsbStorageBlocker(guardianCore.EventLogger)
+                    {
+                        Store = blockedDeviceStore
+                    };
                     storageBlocker.BlockUsbStorageDevice(device);
                 }
                 else if (UsbStorageBlocker.IsHidDevice(device))
@@ -525,12 +578,25 @@ namespace USBGuardian
                     // HID device (keyboard/mouse): ConfigFlags |= 0x100 is sufficient
                     Debug.WriteLine("🔒 HID device detected — using ConfigFlags registry block");
                     string instancePath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
-                    SetDeviceConfigFlags(instancePath, 0x100, "HID device");
+                    var actions = new List<BlockActionRecord>();
+                    SetDeviceConfigFlagsRecorded(instancePath, 0x100, "HID device", actions);
+
+                    blockedDeviceStore.AddOrUpdate(new BlockedDeviceRecord
+                    {
+                        Vid = device.Vid ?? string.Empty,
+                        Pid = device.Pid ?? string.Empty,
+                        InstanceId = device.InstanceId ?? string.Empty,
+                        SerialNumber = device.SerialNumber ?? string.Empty,
+                        Description = device.Description ?? string.Empty,
+                        BlockReason = "User blocked HID device",
+                        Actions = actions
+                    });
                 }
                 else
                 {
                     // Unknown device type: disable via WMI Win32_PnPEntity and set registry flags
                     Debug.WriteLine("🔒 Unknown device type — disabling via WMI and setting registry flags");
+                    var actions = new List<BlockActionRecord>();
                     try
                     {
                         string wmiQuery = $"SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_{device.Vid}&PID_{device.Pid}%'";
@@ -539,6 +605,7 @@ namespace USBGuardian
                         {
                             obj.InvokeMethod("Disable", null);
                             Debug.WriteLine($"Unknown device disabled via WMI: {obj["DeviceID"]}");
+                            actions.Add(new BlockActionRecord { ActionType = "WmiDisable" });
                             break;
                         }
                     }
@@ -548,7 +615,18 @@ namespace USBGuardian
                     }
 
                     string unknownPath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
-                    SetDeviceConfigFlags(unknownPath, 0x100, "Unknown device");
+                    SetDeviceConfigFlagsRecorded(unknownPath, 0x100, "Unknown device", actions);
+
+                    blockedDeviceStore.AddOrUpdate(new BlockedDeviceRecord
+                    {
+                        Vid = device.Vid ?? string.Empty,
+                        Pid = device.Pid ?? string.Empty,
+                        InstanceId = device.InstanceId ?? string.Empty,
+                        SerialNumber = device.SerialNumber ?? string.Empty,
+                        Description = device.Description ?? string.Empty,
+                        BlockReason = "User blocked unknown device",
+                        Actions = actions
+                    });
                 }
 
                 ShowBalloonTip("USB Device Blocked",
@@ -573,6 +651,34 @@ namespace USBGuardian
                 int current = (int)(key.GetValue("ConfigFlags", 0) ?? 0);
                 key.SetValue("ConfigFlags", current | flags, RegistryValueKind.DWord);
                 Debug.WriteLine($"{deviceLabel} disabled via registry (ConfigFlags |= 0x{flags:X}): {instancePath}");
+            }
+            else
+            {
+                Debug.WriteLine($"Registry key not found for {deviceLabel}: {instancePath}");
+            }
+        }
+
+        /// <summary>
+        /// Same as <see cref="SetDeviceConfigFlags"/> but also appends a
+        /// <see cref="BlockActionRecord"/> to <paramref name="actionLog"/> with the
+        /// previous ConfigFlags value so the change can be reversed later.
+        /// </summary>
+        private static void SetDeviceConfigFlagsRecorded(
+            string instancePath, int flags, string deviceLabel,
+            List<BlockActionRecord> actionLog)
+        {
+            using RegistryKey key = Registry.LocalMachine.OpenSubKey(instancePath, true);
+            if (key != null)
+            {
+                int previous = (int)(key.GetValue("ConfigFlags", 0) ?? 0);
+                key.SetValue("ConfigFlags", previous | flags, RegistryValueKind.DWord);
+                Debug.WriteLine($"{deviceLabel} disabled via registry (ConfigFlags |= 0x{flags:X}): {instancePath}");
+                actionLog.Add(new BlockActionRecord
+                {
+                    ActionType = "ConfigFlags",
+                    RegistryPath = instancePath,
+                    PreviousConfigFlags = previous
+                });
             }
             else
             {
@@ -773,6 +879,19 @@ namespace USBGuardian
                 failures.Add($"TEST 5 FAILED: File system write permissions: {ex.Message}");
             }
 
+            // TEST 6: Blocked-device store JSON persistence self-test
+            try
+            {
+                if (!BlockedDeviceStore.RunSelfTest())
+                    failures.Add("TEST 6 FAILED: Blocked-device store persistence self-test did not pass.");
+                else
+                    Debug.WriteLine("[StartupTest] TEST 6 PASSED: Blocked-device store self-test");
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"TEST 6 EXCEPTION: Blocked-device store self-test: {ex.Message}");
+            }
+
             if (failures.Count > 0)
             {
                 string message = "🚨 CRITICAL: USB Guardian startup safety tests FAILED:\n\n" +
@@ -784,7 +903,7 @@ namespace USBGuardian
             }
             else
             {
-                Debug.WriteLine("[StartupTest] All 5 startup safety tests PASSED.");
+                Debug.WriteLine("[StartupTest] All 6 startup safety tests PASSED.");
             }
         }
 
