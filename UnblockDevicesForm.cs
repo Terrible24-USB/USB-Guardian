@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Linq;
 using System.Security.Principal;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace USBGuardian
 {
@@ -19,6 +20,10 @@ namespace USBGuardian
     ///   but unblock is disabled with a clear message offering to restart as admin.
     /// - Dry-run mode: when <see cref="UnblockManager.DryRun"/> is true the form
     ///   shows "[DRY RUN]" labels and unblock actions are only logged.
+    /// - After a successful unblock the form indicates whether an immediate
+    ///   re-enable was possible or the user should unplug/replug the device.
+    /// - If a legacy USB storage block is detected (USBSTOR\Start==4 with no
+    ///   recorded previous value), a "Restore USB Storage" button is shown.
     /// </summary>
     public class UnblockDevicesForm : Form
     {
@@ -28,6 +33,8 @@ namespace USBGuardian
 
         private ListView _listView;
         private Button _btnUnblock;
+        private Button _btnClearLegacy;
+        private Button _btnRestoreUsbStor;
         private Button _btnClose;
         private Label _lblStatus;
         private Label _lblPrivilegeWarning;
@@ -40,6 +47,7 @@ namespace USBGuardian
 
             InitializeComponent();
             PopulateList();
+            RefreshLegacyBanner();
         }
 
         // ---- Form construction ----
@@ -47,7 +55,7 @@ namespace USBGuardian
         private void InitializeComponent()
         {
             Text = "USB Guardian – Unblock Devices";
-            Size = new Size(780, 520);
+            Size = new Size(780, 560);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -94,7 +102,7 @@ namespace USBGuardian
             _listView = new ListView
             {
                 Location = new Point(12, _isElevated ? 46 : 76),
-                Size = new Size(740, _isElevated ? 340 : 310),
+                Size = new Size(740, _isElevated ? 330 : 300),
                 View = View.Details,
                 FullRowSelect = true,
                 GridLines = true,
@@ -111,7 +119,7 @@ namespace USBGuardian
             // Status label
             _lblStatus = new Label
             {
-                Location = new Point(12, _isElevated ? 396 : 396),
+                Location = new Point(12, _isElevated ? 386 : 386),
                 Size = new Size(740, 20),
                 ForeColor = Color.DimGray,
                 Text = string.Empty
@@ -121,7 +129,7 @@ namespace USBGuardian
             _btnUnblock = new Button
             {
                 Text = "Unblock Selected Device",
-                Location = new Point(12, 422),
+                Location = new Point(12, 412),
                 Size = new Size(200, 36),
                 BackColor = Color.FromArgb(0, 120, 212),
                 ForeColor = Color.White,
@@ -130,12 +138,39 @@ namespace USBGuardian
             };
             _btnUnblock.Click += BtnUnblock_Click;
 
+            // Clear legacy ConfigFlags button
+            _btnClearLegacy = new Button
+            {
+                Text = "Clear Legacy ConfigFlags",
+                Location = new Point(220, 412),
+                Size = new Size(180, 36),
+                BackColor = Color.FromArgb(180, 100, 0),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Enabled = false,
+                Visible = true
+            };
+            _btnClearLegacy.Click += BtnClearLegacy_Click;
+
+            // Restore USB Storage button (shown when legacy block detected)
+            _btnRestoreUsbStor = new Button
+            {
+                Text = "⚠ Restore USB Storage",
+                Location = new Point(12, 454),
+                Size = new Size(200, 36),
+                BackColor = Color.DarkRed,
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Visible = false
+            };
+            _btnRestoreUsbStor.Click += BtnRestoreUsbStor_Click;
+
             // Restart-as-admin button (only shown when not elevated)
             var btnRestart = new Button
             {
                 Visible = !_isElevated,
                 Text = "🔒 Restart as Administrator",
-                Location = new Point(220, 422),
+                Location = new Point(220, 454),
                 Size = new Size(200, 36),
                 BackColor = Color.DarkOrange,
                 ForeColor = Color.White,
@@ -147,17 +182,17 @@ namespace USBGuardian
             var btnRefresh = new Button
             {
                 Text = "Refresh",
-                Location = new Point(430, 422),
+                Location = new Point(430, 412),
                 Size = new Size(100, 36),
                 FlatStyle = FlatStyle.Flat
             };
-            btnRefresh.Click += (_, _) => PopulateList();
+            btnRefresh.Click += (_, _) => { PopulateList(); RefreshLegacyBanner(); };
 
             // Close button
             _btnClose = new Button
             {
                 Text = "Close",
-                Location = new Point(652, 422),
+                Location = new Point(652, 412),
                 Size = new Size(100, 36),
                 FlatStyle = FlatStyle.Flat
             };
@@ -167,7 +202,8 @@ namespace USBGuardian
             {
                 lblTitle, lblDryRun, _lblPrivilegeWarning,
                 _listView, _lblStatus,
-                _btnUnblock, btnRestart, btnRefresh, _btnClose
+                _btnUnblock, _btnClearLegacy, _btnRestoreUsbStor,
+                btnRestart, btnRefresh, _btnClose
             });
         }
 
@@ -196,16 +232,28 @@ namespace USBGuardian
                 : $"{records.Count} blocked device(s) found.";
 
             _btnUnblock.Enabled = false;
+            _btnClearLegacy.Enabled = false;
+        }
+
+        /// <summary>
+        /// Show or hide the "Restore USB Storage" banner based on whether a legacy block
+        /// is currently active.
+        /// </summary>
+        private void RefreshLegacyBanner()
+        {
+            bool isLegacy = _unblockManager.IsLegacyUsbStorBlock();
+            _btnRestoreUsbStor.Visible = isLegacy;
         }
 
         // ---- Event handlers ----
 
         private void ListView_SelectedIndexChanged(object? sender, EventArgs e)
         {
-            // Only enable unblock when elevated (or dry-run mode)
-            _btnUnblock.Enabled =
-                _listView.SelectedItems.Count > 0 &&
-                (_isElevated || _unblockManager.DryRun);
+            bool hasSelection = _listView.SelectedItems.Count > 0;
+            bool canAct = hasSelection && (_isElevated || _unblockManager.DryRun);
+
+            _btnUnblock.Enabled = canAct;
+            _btnClearLegacy.Enabled = canAct;
         }
 
         private void BtnUnblock_Click(object? sender, EventArgs e)
@@ -311,13 +359,18 @@ namespace USBGuardian
             try
             {
                 Cursor = Cursors.WaitCursor;
-                List<string> results = _unblockManager.UnblockDevice(record);
+                UnblockResult result = _unblockManager.UnblockDevice(record);
                 Cursor = Cursors.Default;
 
-                string summary = string.Join("\n• ", results);
+                string summary = string.Join("\n• ", result.Messages);
                 string title = _unblockManager.DryRun ? "Dry Run Results" : "Unblock Results";
+
+                string replugNote = result.NeedsReplug && !_unblockManager.DryRun
+                    ? "\n\n📌 Please unplug and plug the device back in to complete recovery."
+                    : string.Empty;
+
                 MessageBox.Show(
-                    $"Actions performed:\n• {summary}",
+                    $"Actions performed:\n• {summary}{replugNote}",
                     title,
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
@@ -346,9 +399,11 @@ namespace USBGuardian
                 }
 
                 PopulateList();
+                RefreshLegacyBanner();
                 _lblStatus.Text = _unblockManager.DryRun
                     ? $"[DRY RUN] Unblock simulated for {record.Description}"
-                    : $"Device unblocked: {record.Description}";
+                    : $"Device unblocked: {record.Description}" +
+                      (result.NeedsReplug ? " (unplug/replug required)" : string.Empty);
             }
             catch (Exception ex)
             {
@@ -363,6 +418,63 @@ namespace USBGuardian
             }
         }
 
+        private void BtnClearLegacy_Click(object? sender, EventArgs e)
+        {
+            if (_listView.SelectedItems.Count == 0) return;
+
+            var record = (BlockedDeviceRecord)_listView.SelectedItems[0].Tag;
+            if (record == null) return;
+
+            string dryNote = _unblockManager.DryRun ? "\n\n(DRY RUN: no actual changes will be made)" : string.Empty;
+            var confirm = MessageBox.Show(
+                $"Clear legacy ConfigFlags for:\n  {record.Description}\n  VID:{record.Vid}  PID:{record.Pid}\n\n" +
+                "This will clear only the disable bits (0x100 and 0x40) from registry ConfigFlags " +
+                "on the known registry paths for this device. No other values will be changed." +
+                dryNote + "\n\nProceed?",
+                "Confirm: Clear Legacy ConfigFlags",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question,
+                MessageBoxDefaultButton.Button2);
+
+            if (confirm != DialogResult.Yes) return;
+
+            try
+            {
+                Cursor = Cursors.WaitCursor;
+                List<string> results = _unblockManager.ClearLegacyConfigFlags(record);
+                Cursor = Cursors.Default;
+
+                string summary = string.Join("\n• ", results);
+                MessageBox.Show(
+                    $"Results:\n• {summary}\n\n" +
+                    "If the device is still not detected, please unplug and reconnect it.",
+                    _unblockManager.DryRun ? "Dry Run – Clear Legacy ConfigFlags" : "Clear Legacy ConfigFlags",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+
+                _lblStatus.Text = _unblockManager.DryRun
+                    ? $"[DRY RUN] Legacy clear simulated for {record.Description}"
+                    : $"Legacy ConfigFlags cleared for {record.Description}";
+            }
+            catch (Exception ex)
+            {
+                Cursor = Cursors.Default;
+                MessageBox.Show(
+                    $"Clear legacy ConfigFlags failed:\n{ex.Message}",
+                    "Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                _lblStatus.Text = $"Error: {ex.Message}";
+            }
+        }
+
+        private void BtnRestoreUsbStor_Click(object? sender, EventArgs e)
+        {
+            using var form = new LegacyStorageRecoveryForm(_unblockManager);
+            form.ShowDialog(this);
+            RefreshLegacyBanner();
+        }
+
         private void BtnRestart_Click(object? sender, EventArgs e)
         {
             var confirm = MessageBox.Show(
@@ -375,13 +487,13 @@ namespace USBGuardian
 
             try
             {
-                var psi = new ProcessStartInfo
+                var psi = new System.Diagnostics.ProcessStartInfo
                 {
                     FileName = Application.ExecutablePath,
                     Verb = "runas",   // triggers UAC elevation prompt
                     UseShellExecute = true
                 };
-                Process.Start(psi);
+                System.Diagnostics.Process.Start(psi);
                 Application.Exit();
             }
             catch (Exception ex)
@@ -411,3 +523,4 @@ namespace USBGuardian
         }
     }
 }
+
