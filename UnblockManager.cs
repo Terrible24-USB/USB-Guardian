@@ -367,9 +367,6 @@ namespace USBGuardian
                 if (!string.IsNullOrEmpty(record.PnpDeviceId))
                     queries.Add(($"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{WmiEscape(record.PnpDeviceId)}'", true));
 
-                if (!string.IsNullOrEmpty(record.InstanceId) && record.InstanceId != "Unknown")
-                    queries.Add(($"SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_{record.Vid}&PID_{record.Pid}%{WmiEscape(record.InstanceId)}%'", true));
-
                 // Broad VID/PID LIKE match (catches composite device + all interface nodes)
                 queries.Add(($"SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_{record.Vid}&PID_{record.Pid}%'", false));
 
@@ -455,6 +452,10 @@ namespace USBGuardian
                     CM_Reenumerate_DevNode(rootInst, CM_REENUMERATE_NORMAL);
                     log.Add("Triggered root re-enumeration (scan for hardware changes)");
                     anyOk = true;
+                }
+                else
+                {
+                    Debug.WriteLine($"[UnblockManager] CM_Locate_DevNode for root failed: 0x{cr:X}");
                 }
             }
             catch (Exception ex)
