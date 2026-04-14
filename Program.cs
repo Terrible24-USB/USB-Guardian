@@ -38,7 +38,19 @@ namespace USBGuardian
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new USBApplicationContext());
+            try
+            {
+                Application.Run(new USBApplicationContext());
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[USB Guardian] Fatal startup error: {ex}");
+                MessageBox.Show(
+                    $"USB Guardian failed to start:\n\n{ex.Message}\n\nSee the debug output or event log for details.",
+                    "USB Guardian — Startup Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
         }
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -95,7 +107,16 @@ namespace USBGuardian
         public USBMessageWindow()
         {
             CreateHandle(new CreateParams());
-            RegisterForUsbNotifications();
+
+            try
+            {
+                RegisterForUsbNotifications();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Startup] RegisterForUsbNotifications failed: {ex.Message}");
+            }
+
             deviceIdentifier = new DeviceIdentifier();
             whitelist = LoadWhitelist();
             historyManager = new DeviceHistoryManager();
@@ -131,7 +152,16 @@ namespace USBGuardian
             CheckUsbStorStartupWarning();
 
             // Check for HID input device lockout and show emergency recovery UI if needed
-            emergencyRecoveryManager.DetectAndShowRecoveryIfNeeded();
+            try
+            {
+                emergencyRecoveryManager.DetectAndShowRecoveryIfNeeded();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Startup] Emergency recovery check failed: {ex.Message}");
+                guardianCore?.EventLogger?.LogWarning(0, "EmergencyRecoveryError",
+                    $"Emergency recovery check failed at startup: {ex}");
+            }
 
             Debug.WriteLine("USB Guardian Started - Monitoring for USB devices...");
         }
