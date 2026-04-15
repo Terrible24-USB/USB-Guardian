@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Management;
+using System.Runtime.InteropServices;
+using System.Threading;
 using Microsoft.Win32;
 
 namespace USBGuardian
@@ -15,6 +17,22 @@ namespace USBGuardian
         // ConfigFlags bit values used to prevent Windows from re-enumerating the device
         private const int ConfigFlagDisabled = 0x100;   // CONFIGFLAG_DISABLED
         private const int ConfigFlagReinstall = 0x40;   // CONFIGFLAG_REINSTALL (prevents auto re-install)
+
+        // cfgmgr32 constants for device re-enumeration (_WL = Windows-standard flag value of zero)
+        private const int  CM_CR_SUCCESS              = 0;
+        private const uint CM_LOCATE_DEVNODE_NORMAL   = 0;
+        private const uint CM_REENUMERATE_NORMAL      = 0;
+
+        // Time to wait after triggering cfgmgr32 re-enumeration before attempting eject.
+        // Windows needs ~500–800 ms to process the ConfigFlags disable bits and tear down
+        // the device node; 600 ms is a safe middle-ground that avoids the re-mount race.
+        private const int ReEnumerationDelayMs = 600;
+
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+        private static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string? pDeviceID, uint ulFlags);
+
+        [DllImport("cfgmgr32.dll")]
+        private static extern int CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
 
         private readonly SecurityEventLogger _logger;
 
@@ -72,24 +90,37 @@ namespace USBGuardian
             {
                 _logger.LogAttack(0, "StorageBlock", $"Blocking USB storage device {vidPid}", vidPid);
 
-                // Step 1: Find and eject the drive letter(s) associated with this device
-                bool ejected = EjectUsbVolume(device.Vid, device.Pid);
-                if (ejected)
-                {
-                    anySuccess = true;
-                    Debug.WriteLine($"[UsbStorageBlocker] Volume ejected for {vidPid}");
-                }
-                else
-                {
-                    Debug.WriteLine($"[UsbStorageBlocker] Eject did not complete for {vidPid} — continuing with registry block");
-                }
-
-                // Step 2: Set registry flags to prevent re-enumeration (captures previous values)
+                // Step 1: Set registry flags FIRST to prevent re-enumeration.
+                // ConfigFlags must be written before Windows re-enumerates so that
+                // when the re-enumeration trigger (Step 2) fires, the OS sees the
+                // disabled bits and does NOT re-mount the volume.
                 bool flagged = SetPermanentBlockFlags(device, actions);
                 if (flagged)
                 {
                     anySuccess = true;
                     Debug.WriteLine($"[UsbStorageBlocker] Registry block flags set for {vidPid}");
+                }
+
+                // Step 2: Trigger cfgmgr32 re-enumeration so Windows processes the
+                // disable bits we just wrote.  This closes the race window where
+                // Windows would otherwise re-mount the volume before seeing ConfigFlags.
+                TriggerReEnumeration(vidPid);
+
+                // Step 3: Wait for Windows to process the re-enumeration and apply the
+                // ConfigFlags, giving the OS time to tear down the device node.
+                Thread.Sleep(ReEnumerationDelayMs);
+
+                // Step 4: Eject any still-mounted volumes (the drive may already be gone
+                // because ConfigFlags prevented re-mount, so a failure here is expected
+                // and does not indicate an overall block failure).
+                bool ejected = EjectUsbVolume(device.Vid, device.Pid);
+                if (ejected)
+                {
+                    Debug.WriteLine($"[UsbStorageBlocker] Volume ejected for {vidPid}");
+                }
+                else
+                {
+                    Debug.WriteLine($"[UsbStorageBlocker] Eject did not complete for {vidPid} — drive may already be gone due to ConfigFlags");
                 }
 
                 _logger.LogCritical(0, "StorageBlock", $"USB storage block complete for {vidPid}: eject={ejected}, registry={flagged}", vidPid);
@@ -421,6 +452,33 @@ namespace USBGuardian
         // -------------------------------------------------------------------------
         // Private helpers
         // -------------------------------------------------------------------------
+
+        /// <summary>
+        /// Triggers a root-level cfgmgr32 re-enumeration so Windows processes the
+        /// ConfigFlags disable bits that were just written to the registry.
+        /// This forces Windows to see the disabled state and prevents the device
+        /// from being re-mounted after the block operation.
+        /// </summary>
+        private void TriggerReEnumeration(string vidPid)
+        {
+            try
+            {
+                int cr = CM_Locate_DevNodeW(out uint rootInst, null, CM_LOCATE_DEVNODE_NORMAL);
+                if (cr == CM_CR_SUCCESS)
+                {
+                    CM_Reenumerate_DevNode(rootInst, CM_REENUMERATE_NORMAL);
+                    Debug.WriteLine($"[UsbStorageBlocker] Triggered cfgmgr32 re-enumeration for {vidPid}");
+                }
+                else
+                {
+                    Debug.WriteLine($"[UsbStorageBlocker] CM_Locate_DevNodeW failed (cr={cr}) for {vidPid}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[UsbStorageBlocker] TriggerReEnumeration failed: {ex.Message}");
+            }
+        }
 
         private static string FindPhysicalDrive(string vid, string pid)
         {
