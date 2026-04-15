@@ -41,6 +41,12 @@ namespace USBGuardian
         private const int ConfigFlagDisabled  = 0x100;
         private const int ConfigFlagReinstall = 0x40;
 
+        // Timing constants for post-unblock device verification
+        // ConfigFlags changes need a brief delay before Windows processes them.
+        private const int ConfigFlagsProcessingDelayMs = 500;
+        // After re-enumeration, Windows may need extra time to bind drivers.
+        private const int ReEnumerationDelayMs = 800;
+
         // CfgMgr32 P/Invoke for device re-enumeration
         [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
         private static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string? pDeviceID, uint ulFlags);
@@ -144,16 +150,78 @@ namespace USBGuardian
                 }
             }
 
-            // Best-effort re-enumeration via cfgmgr32 so the device may come back
-            // without a physical unplug/replug.
+            // Re-enumeration via cfgmgr32 — give Windows time to process the
+            // ConfigFlags change before triggering hardware re-scan.
+            if (!DryRun)
+                System.Threading.Thread.Sleep(ConfigFlagsProcessingDelayMs);
+
             bool reEnumOk = TryReEnumerateDevice(record, result.Messages);
-            result.NeedsReplug = !reEnumOk;
+
+            // Wait for Windows to process the re-enumeration, then check whether
+            // the device can actually be found in a ready state via WMI.
+            if (reEnumOk && !DryRun)
+            {
+                System.Threading.Thread.Sleep(ReEnumerationDelayMs);
+                bool deviceReady = IsDeviceReadyViaWmi(record);
+                result.NeedsReplug = !deviceReady;
+                if (deviceReady)
+                    result.Messages.Add("Device confirmed active — no replug required.");
+                else
+                    result.Messages.Add("Device not yet visible after re-enumeration — please unplug and replug the device.");
+            }
+            else
+            {
+                result.NeedsReplug = !reEnumOk;
+            }
 
             // Remove from the store so it no longer appears in the unblock list
             if (!DryRun)
                 _store.Remove(record);
 
             return result;
+        }
+
+        /// <summary>
+        /// Returns true if the device described by <paramref name="record"/> can be
+        /// found in an enabled (non-error) state via WMI Win32_PnPEntity after an
+        /// unblock/re-enumeration cycle.
+        /// </summary>
+        private static bool IsDeviceReadyViaWmi(BlockedDeviceRecord record)
+        {
+            if (string.IsNullOrEmpty(record.Vid) || string.IsNullOrEmpty(record.Pid))
+                return false;
+
+            try
+            {
+                // Try exact PnpDeviceId first for fastest lookup
+                if (!string.IsNullOrEmpty(record.PnpDeviceId))
+                {
+                    string exactWql = $"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{WmiEscape(record.PnpDeviceId)}'";
+                    using var exact = new ManagementObjectSearcher(exactWql);
+                    foreach (ManagementObject obj in exact.Get())
+                    {
+                        string status = obj["Status"]?.ToString() ?? string.Empty;
+                        // "OK" or "Unknown" both indicate the device is present and not in error
+                        if (!string.Equals(status, "Error", StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+
+                // Broad VID/PID search as fallback
+                string broadWql = $"SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_{record.Vid}&PID_{record.Pid}%'";
+                using var broad = new ManagementObjectSearcher(broadWql);
+                foreach (ManagementObject obj in broad.Get())
+                {
+                    string status = obj["Status"]?.ToString() ?? string.Empty;
+                    if (!string.Equals(status, "Error", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[UnblockManager] IsDeviceReadyViaWmi error: {ex.Message}");
+            }
+            return false;
         }
 
         /// <summary>
