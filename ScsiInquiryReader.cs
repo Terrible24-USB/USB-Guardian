@@ -21,10 +21,13 @@ public static class ScsiInquiryReader
     // =========================
     public static string GetUsbPhysicalDrive(string vid, string pid)
     {
-        using (var searcher = new ManagementObjectSearcher(
-            "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'"))
+        ManagementObjectCollection results = null;
+        try
         {
-            foreach (ManagementObject drive in searcher.Get())
+            var searcher = new ManagementObjectSearcher(
+                "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
+            results = searcher.Get();
+            foreach (ManagementObject drive in results)
             {
                 string pnpDeviceId = drive["PNPDeviceID"]?.ToString() ?? "";
 
@@ -36,6 +39,10 @@ public static class ScsiInquiryReader
                         return deviceId; // Example: \\.\PHYSICALDRIVE2
                 }
             }
+        }
+        finally
+        {
+            results?.Dispose();
         }
 
         return null;
