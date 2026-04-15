@@ -786,13 +786,22 @@ namespace USBGuardian
                     try
                     {
                         string wmiQuery = $"SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_{device.Vid}&PID_{device.Pid}%'";
-                        using var searcher = new System.Management.ManagementObjectSearcher(wmiQuery);
-                        foreach (System.Management.ManagementObject obj in searcher.Get())
+                        System.Management.ManagementObjectCollection wmiResults = null;
+                        try
                         {
-                            obj.InvokeMethod("Disable", null);
-                            Debug.WriteLine($"Unknown device disabled via WMI: {obj["DeviceID"]}");
-                            actions.Add(new BlockActionRecord { ActionType = "WmiDisable" });
-                            break;
+                            using var searcher = new System.Management.ManagementObjectSearcher(wmiQuery);
+                            wmiResults = searcher.Get();
+                            foreach (System.Management.ManagementObject obj in wmiResults)
+                            {
+                                obj.InvokeMethod("Disable", null);
+                                Debug.WriteLine($"Unknown device disabled via WMI: {obj["DeviceID"]}");
+                                actions.Add(new BlockActionRecord { ActionType = "WmiDisable" });
+                                break;
+                            }
+                        }
+                        finally
+                        {
+                            wmiResults?.Dispose();
                         }
                     }
                     catch (Exception wmiEx)
@@ -931,10 +940,12 @@ namespace USBGuardian
 
             foreach (string wql in queries)
             {
+                ManagementObjectCollection results = null;
                 try
                 {
                     using var searcher = new ManagementObjectSearcher(wql);
-                    foreach (ManagementObject obj in searcher.Get())
+                    results = searcher.Get();
+                    foreach (ManagementObject obj in results)
                     {
                         if (obj == null) continue;
                         string devId = obj["DeviceID"]?.ToString() ?? string.Empty;
@@ -955,6 +966,10 @@ namespace USBGuardian
                 catch (Exception ex)
                 {
                     Debug.WriteLine($"[WhitelistEnforcement] WMI query failed ({wql}): {ex.Message}");
+                }
+                finally
+                {
+                    results?.Dispose();
                 }
             }
         }
@@ -1527,10 +1542,13 @@ namespace USBGuardian
                 {
                     // Step 1: Find the physical drive that matches VID/PID
                     string physicalDrive = null;
-                    using (var searcher = new ManagementObjectSearcher(
-                        "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'"))
+                    ManagementObjectCollection diskResults = null;
+                    try
                     {
-                        foreach (ManagementObject disk in searcher.Get())
+                        using var searcher = new ManagementObjectSearcher(
+                            "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
+                        diskResults = searcher.Get();
+                        foreach (ManagementObject disk in diskResults)
                         {
                             string pnpDeviceId = SafeGetString(disk, "PNPDeviceID");
                             if (!string.IsNullOrEmpty(pnpDeviceId) && pnpDeviceId.Contains($"VID_{vid}&PID_{pid}"))
@@ -1540,32 +1558,50 @@ namespace USBGuardian
                             }
                         }
                     }
+                    finally
+                    {
+                        diskResults?.Dispose();
+                    }
 
                     if (string.IsNullOrEmpty(physicalDrive))
                         return null;
 
                     // Step 2: Get the disk drive's partitions
-                    using (var partitionSearcher = new ManagementObjectSearcher(
-                        $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{physicalDrive}'}} WHERE AssocClass=Win32_DiskDriveToDiskPartition"))
+                    ManagementObjectCollection partResults = null;
+                    try
                     {
-                        foreach (ManagementObject partition in partitionSearcher.Get())
+                        using var partitionSearcher = new ManagementObjectSearcher(
+                            $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{physicalDrive}'}} WHERE AssocClass=Win32_DiskDriveToDiskPartition");
+                        partResults = partitionSearcher.Get();
+                        foreach (ManagementObject partition in partResults)
                         {
                             string partitionDeviceId = SafeGetString(partition, "DeviceID");
                             if (string.IsNullOrEmpty(partitionDeviceId))
                                 continue;
 
                             // Step 3: Get logical disks from partition
-                            using (var logicalSearcher = new ManagementObjectSearcher(
-                                $"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{partitionDeviceId}'}} WHERE AssocClass=Win32_LogicalDiskToPartition"))
+                            ManagementObjectCollection logicalResults = null;
+                            try
                             {
-                                foreach (ManagementObject logical in logicalSearcher.Get())
+                                using var logicalSearcher = new ManagementObjectSearcher(
+                                    $"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{partitionDeviceId}'}} WHERE AssocClass=Win32_LogicalDiskToPartition");
+                                logicalResults = logicalSearcher.Get();
+                                foreach (ManagementObject logical in logicalResults)
                                 {
                                     string volumeSerial = SafeGetString(logical, "VolumeSerialNumber");
                                     if (!string.IsNullOrEmpty(volumeSerial))
                                         return volumeSerial;
                                 }
                             }
+                            finally
+                            {
+                                logicalResults?.Dispose();
+                            }
                         }
+                    }
+                    finally
+                    {
+                        partResults?.Dispose();
                     }
                 }
                 catch (Exception ex)
@@ -1577,27 +1613,31 @@ namespace USBGuardian
 
             private string GetPhysicalDrivePath(string vid, string pid)
             {
+                ManagementObjectCollection results = null;
                 try
                 {
-                    using (var searcher = new ManagementObjectSearcher(
-                        "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'"))
+                    using var searcher = new ManagementObjectSearcher(
+                        "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
+                    results = searcher.Get();
+                    foreach (ManagementObject disk in results)
                     {
-                        foreach (ManagementObject disk in searcher.Get())
+                        string pnpDeviceId = SafeGetString(disk, "PNPDeviceID");
+                        Debug.WriteLine($"[GetPhysicalDrivePath] Checking disk: {pnpDeviceId}");
+                        if (!string.IsNullOrEmpty(pnpDeviceId) && pnpDeviceId.Contains($"VID_{vid}&PID_{pid}"))
                         {
-                            string pnpDeviceId = SafeGetString(disk, "PNPDeviceID");
-                            Debug.WriteLine($"[GetPhysicalDrivePath] Checking disk: {pnpDeviceId}");
-                            if (!string.IsNullOrEmpty(pnpDeviceId) && pnpDeviceId.Contains($"VID_{vid}&PID_{pid}"))
-                            {
-                                string deviceId = SafeGetString(disk, "DeviceID");
-                                Debug.WriteLine($"[GetPhysicalDrivePath] Found: {deviceId}");
-                                return deviceId; // e.g., \\.\PHYSICALDRIVE1
-                            }
+                            string deviceId = SafeGetString(disk, "DeviceID");
+                            Debug.WriteLine($"[GetPhysicalDrivePath] Found: {deviceId}");
+                            return deviceId; // e.g., \\.\PHYSICALDRIVE1
                         }
                     }
                 }
                 catch (Exception ex)
                 {
                     Debug.WriteLine($"[GetPhysicalDrivePath] Error: {ex.Message}");
+                }
+                finally
+                {
+                    results?.Dispose();
                 }
                 return null;
             }
@@ -1859,40 +1899,44 @@ namespace USBGuardian
                         fingerprint.Service?.Equals("usbstor", StringComparison.OrdinalIgnoreCase) == true ||
                         fingerprint.Service?.Equals("disk", StringComparison.OrdinalIgnoreCase) == true)
                     {
+                        ManagementObjectCollection diskResults = null;
                         try
                         {
-                            using (var searcher = new ManagementObjectSearcher(
-                                "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'"))
+                            using var searcher = new ManagementObjectSearcher(
+                                "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
+                            diskResults = searcher.Get();
+                            foreach (ManagementObject disk in diskResults)
                             {
-                                foreach (ManagementObject disk in searcher.Get())
+                                string pnpDeviceId = SafeGetString(disk, "PNPDeviceID");
+                                if (!string.IsNullOrEmpty(pnpDeviceId) &&
+                                    pnpDeviceId.IndexOf($"VID_{fingerprint.Vid}&PID_{fingerprint.Pid}", StringComparison.OrdinalIgnoreCase) >= 0)
                                 {
-                                    string pnpDeviceId = SafeGetString(disk, "PNPDeviceID");
-                                    if (!string.IsNullOrEmpty(pnpDeviceId) &&
-                                        pnpDeviceId.IndexOf($"VID_{fingerprint.Vid}&PID_{fingerprint.Pid}", StringComparison.OrdinalIgnoreCase) >= 0)
-                                    {
-                                        fingerprint.Win32Name = SafeGetString(disk, "DeviceID");
+                                    fingerprint.Win32Name = SafeGetString(disk, "DeviceID");
 
-                                        object sizeObj = disk["Size"];
-                                        if (sizeObj != null && long.TryParse(sizeObj.ToString(), out long sz))
-                                            fingerprint.StorageTotalBytes = sz;
+                                    object sizeObj = disk["Size"];
+                                    if (sizeObj != null && long.TryParse(sizeObj.ToString(), out long sz))
+                                        fingerprint.StorageTotalBytes = sz;
 
-                                        // Kernel name from PNP device ID e.g. USBSTOR\DISK -> disk.sys
-                                        string caption = SafeGetString(disk, "Caption");
-                                        if (!string.IsNullOrEmpty(fingerprint.Service) && string.IsNullOrEmpty(fingerprint.KernelName))
-                                            fingerprint.KernelName = fingerprint.Service + ".sys";
+                                    // Kernel name from PNP device ID e.g. USBSTOR\DISK -> disk.sys
+                                    string caption = SafeGetString(disk, "Caption");
+                                    if (!string.IsNullOrEmpty(fingerprint.Service) && string.IsNullOrEmpty(fingerprint.KernelName))
+                                        fingerprint.KernelName = fingerprint.Service + ".sys";
 
-                                        // Full device ID for storage child (USBSTOR\DISK&VEN_...)
-                                        if (!string.IsNullOrEmpty(pnpDeviceId))
-                                            fingerprint.DeviceId = pnpDeviceId;
+                                    // Full device ID for storage child (USBSTOR\DISK&VEN_...)
+                                    if (!string.IsNullOrEmpty(pnpDeviceId))
+                                        fingerprint.DeviceId = pnpDeviceId;
 
-                                        break;
-                                    }
+                                    break;
                                 }
                             }
                         }
                         catch (Exception ex)
                         {
                             Debug.WriteLine($"[CaptureExtendedDeviceInfo] WMI disk error: {ex.Message}");
+                        }
+                        finally
+                        {
+                            diskResults?.Dispose();
                         }
                     }
                     else if (!string.IsNullOrEmpty(fingerprint.Service) && string.IsNullOrEmpty(fingerprint.KernelName))
@@ -2668,18 +2712,22 @@ namespace USBGuardian
 
             private string GetVolumeSerialNumber()
             {
+                ManagementObjectCollection results = null;
                 try
                 {
-                    using (var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_LogicalDisk WHERE DriveType=2"))
+                    using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_LogicalDisk WHERE DriveType=2");
+                    results = searcher.Get();
+                    foreach (ManagementObject disk in results)
                     {
-                        foreach (ManagementObject disk in searcher.Get())
-                        {
-                            string volumeSerial = disk["VolumeSerialNumber"]?.ToString();
-                            if (!string.IsNullOrEmpty(volumeSerial)) return volumeSerial;
-                        }
+                        string volumeSerial = disk["VolumeSerialNumber"]?.ToString();
+                        if (!string.IsNullOrEmpty(volumeSerial)) return volumeSerial;
                     }
                 }
                 catch { }
+                finally
+                {
+                    results?.Dispose();
+                }
                 return null;
             }
 

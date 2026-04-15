@@ -111,12 +111,13 @@ namespace USBGuardian
         private static List<BlockedInputDevice> QueryInputDevicesViaWmi()
         {
             var devices = new List<BlockedInputDevice>();
+            ManagementObjectCollection results = null;
             try
             {
                 using var searcher = new ManagementObjectSearcher(
                     "SELECT * FROM Win32_PnPEntity WHERE PNPClass='Keyboard' OR PNPClass='Mouse'");
-
-                foreach (ManagementObject obj in searcher.Get())
+                results = searcher.Get();
+                foreach (ManagementObject obj in results)
                 {
                     string? deviceId  = obj["DeviceID"]?.ToString();
                     string? pnpClass  = obj["PNPClass"]?.ToString();
@@ -135,6 +136,10 @@ namespace USBGuardian
             catch (Exception ex)
             {
                 Debug.WriteLine($"[InputDeviceMonitor] WMI query failed: {ex.Message}");
+            }
+            finally
+            {
+                results?.Dispose();
             }
             return devices;
         }

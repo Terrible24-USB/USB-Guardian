@@ -197,24 +197,42 @@ namespace USBGuardian
                 if (!string.IsNullOrEmpty(record.PnpDeviceId))
                 {
                     string exactWql = $"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{WmiEscape(record.PnpDeviceId)}'";
-                    using var exact = new ManagementObjectSearcher(exactWql);
-                    foreach (ManagementObject obj in exact.Get())
+                    ManagementObjectCollection exactResults = null;
+                    try
                     {
-                        string status = obj["Status"]?.ToString() ?? string.Empty;
-                        // "OK" or "Unknown" both indicate the device is present and not in error
-                        if (!string.Equals(status, "Error", StringComparison.OrdinalIgnoreCase))
-                            return true;
+                        using var exact = new ManagementObjectSearcher(exactWql);
+                        exactResults = exact.Get();
+                        foreach (ManagementObject obj in exactResults)
+                        {
+                            string status = obj["Status"]?.ToString() ?? string.Empty;
+                            // "OK" or "Unknown" both indicate the device is present and not in error
+                            if (!string.Equals(status, "Error", StringComparison.OrdinalIgnoreCase))
+                                return true;
+                        }
+                    }
+                    finally
+                    {
+                        exactResults?.Dispose();
                     }
                 }
 
                 // Broad VID/PID search as fallback
                 string broadWql = $"SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_{record.Vid}&PID_{record.Pid}%'";
-                using var broad = new ManagementObjectSearcher(broadWql);
-                foreach (ManagementObject obj in broad.Get())
+                ManagementObjectCollection broadResults = null;
+                try
                 {
-                    string status = obj["Status"]?.ToString() ?? string.Empty;
-                    if (!string.Equals(status, "Error", StringComparison.OrdinalIgnoreCase))
-                        return true;
+                    using var broad = new ManagementObjectSearcher(broadWql);
+                    broadResults = broad.Get();
+                    foreach (ManagementObject obj in broadResults)
+                    {
+                        string status = obj["Status"]?.ToString() ?? string.Empty;
+                        if (!string.Equals(status, "Error", StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+                finally
+                {
+                    broadResults?.Dispose();
                 }
             }
             catch (Exception ex)
@@ -488,10 +506,12 @@ namespace USBGuardian
 
                 foreach (var (wql, exact) in queries)
                 {
+                    ManagementObjectCollection results = null;
                     try
                     {
                         using var searcher = new ManagementObjectSearcher(wql);
-                        foreach (ManagementObject obj in searcher.Get())
+                        results = searcher.Get();
+                        foreach (ManagementObject obj in results)
                         {
                             if (obj == null) continue;
 
@@ -521,6 +541,10 @@ namespace USBGuardian
                     catch (Exception ex)
                     {
                         Debug.WriteLine($"[UnblockManager] WMI query failed: {ex.Message}");
+                    }
+                    finally
+                    {
+                        results?.Dispose();
                     }
                 }
 

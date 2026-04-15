@@ -39,14 +39,23 @@ namespace USBGuardian
             try
             {
                 string query = $"SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_{device.Vid}&PID_{device.Pid}%'";
-                using var searcher = new ManagementObjectSearcher(query);
-                foreach (ManagementObject obj in searcher.Get())
+                ManagementObjectCollection results = null;
+                try
                 {
-                    obj.InvokeMethod("Disable", null);
-                    result.Success = true;
-                    result.Message = $"Disabled via WMI: {obj["DeviceID"]}";
-                    _logger.LogCritical(0, "DeviceBlocked", $"WMI disable: {device.Vid}:{device.Pid} — {result.Message}", $"{device.Vid}:{device.Pid}");
-                    return result;
+                    using var searcher = new ManagementObjectSearcher(query);
+                    results = searcher.Get();
+                    foreach (ManagementObject obj in results)
+                    {
+                        obj.InvokeMethod("Disable", null);
+                        result.Success = true;
+                        result.Message = $"Disabled via WMI: {obj["DeviceID"]}";
+                        _logger.LogCritical(0, "DeviceBlocked", $"WMI disable: {device.Vid}:{device.Pid} — {result.Message}", $"{device.Vid}:{device.Pid}");
+                        return result;
+                    }
+                }
+                finally
+                {
+                    results?.Dispose();
                 }
                 result.Message = "Device not found via WMI";
             }
@@ -131,14 +140,23 @@ namespace USBGuardian
             try
             {
                 string query = $"SELECT * FROM Win32_PnPEntity WHERE DeviceID LIKE '%VID_{device.Vid}&PID_{device.Pid}%'";
-                using var searcher = new ManagementObjectSearcher(query);
-                foreach (ManagementObject obj in searcher.Get())
+                ManagementObjectCollection results = null;
+                try
                 {
-                    obj.InvokeMethod("Enable", null);
-                    result.Success = true;
-                    result.Message = $"Enabled via WMI: {obj["DeviceID"]}";
-                    _logger.LogInfo(0, "DeviceEnabled", $"WMI enable: {device.Vid}:{device.Pid}", $"{device.Vid}:{device.Pid}");
-                    return result;
+                    using var searcher = new ManagementObjectSearcher(query);
+                    results = searcher.Get();
+                    foreach (ManagementObject obj in results)
+                    {
+                        obj.InvokeMethod("Enable", null);
+                        result.Success = true;
+                        result.Message = $"Enabled via WMI: {obj["DeviceID"]}";
+                        _logger.LogInfo(0, "DeviceEnabled", $"WMI enable: {device.Vid}:{device.Pid}", $"{device.Vid}:{device.Pid}");
+                        return result;
+                    }
+                }
+                finally
+                {
+                    results?.Dispose();
                 }
                 result.Message = "Device not found via WMI";
             }

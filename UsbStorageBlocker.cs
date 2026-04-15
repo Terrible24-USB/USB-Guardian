@@ -139,71 +139,89 @@ namespace USBGuardian
 
                 // Walk partitions → logical disks to get drive letters
                 string partitionQuery = $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{physicalDrive}'}} WHERE AssocClass=Win32_DiskDriveToDiskPartition";
-                using var partSearcher = new ManagementObjectSearcher(partitionQuery);
-                foreach (ManagementObject partition in partSearcher.Get())
+                ManagementObjectCollection partitionResults = null;
+                try
                 {
-                    string partId = partition["DeviceID"]?.ToString();
-                    if (string.IsNullOrEmpty(partId)) continue;
-
-                    string logicalQuery = $"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{partId}'}} WHERE AssocClass=Win32_LogicalDiskToPartition";
-                    using var logSearcher = new ManagementObjectSearcher(logicalQuery);
-                    foreach (ManagementObject logical in logSearcher.Get())
+                    using var partSearcher = new ManagementObjectSearcher(partitionQuery);
+                    partitionResults = partSearcher.Get();
+                    foreach (ManagementObject partition in partitionResults)
                     {
-                        string driveLetter = logical["DeviceID"]?.ToString(); // e.g., "F:"
-                        if (string.IsNullOrEmpty(driveLetter)) continue;
+                        string partId = partition["DeviceID"]?.ToString();
+                        if (string.IsNullOrEmpty(partId)) continue;
 
-                        Debug.WriteLine($"[UsbStorageBlocker] Attempting to dismount {driveLetter}");
-
-                        bool thisVolumeEjected = false;
-
-                        // Step 1: Soft dismount (Force=false) — safe eject
-                        if (DismountVolumeWmi(driveLetter, force: false))
+                        string logicalQuery = $"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{partId}'}} WHERE AssocClass=Win32_LogicalDiskToPartition";
+                        ManagementObjectCollection logicalResults = null;
+                        try
                         {
-                            thisVolumeEjected = true;
-                            Debug.WriteLine($"[UsbStorageBlocker] Soft WMI dismount succeeded for {driveLetter}");
-                        }
-                        else
-                        {
-                            // Step 2: Force dismount (Force=true) — ejects even if files are open
-                            Debug.WriteLine($"[UsbStorageBlocker] Soft dismount failed for {driveLetter}, retrying with Force=true");
-                            if (DismountVolumeWmi(driveLetter, force: true))
+                            using var logSearcher = new ManagementObjectSearcher(logicalQuery);
+                            logicalResults = logSearcher.Get();
+                            foreach (ManagementObject logical in logicalResults)
                             {
-                                thisVolumeEjected = true;
-                                Debug.WriteLine($"[UsbStorageBlocker] Force WMI dismount succeeded for {driveLetter}");
-                            }
-                            else
-                            {
-                                // Step 3: PowerShell fallback
-                                if (DismountVolumePs(driveLetter))
+                                string driveLetter = logical["DeviceID"]?.ToString(); // e.g., "F:"
+                                if (string.IsNullOrEmpty(driveLetter)) continue;
+
+                                Debug.WriteLine($"[UsbStorageBlocker] Attempting to dismount {driveLetter}");
+
+                                bool thisVolumeEjected = false;
+
+                                // Step 1: Soft dismount (Force=false) — safe eject
+                                if (DismountVolumeWmi(driveLetter, force: false))
                                 {
                                     thisVolumeEjected = true;
-                                    Debug.WriteLine($"[UsbStorageBlocker] PowerShell dismount succeeded for {driveLetter}");
+                                    Debug.WriteLine($"[UsbStorageBlocker] Soft WMI dismount succeeded for {driveLetter}");
                                 }
                                 else
                                 {
-                                    Debug.WriteLine($"[UsbStorageBlocker] All dismount methods failed for {driveLetter}");
+                                    // Step 2: Force dismount (Force=true) — ejects even if files are open
+                                    Debug.WriteLine($"[UsbStorageBlocker] Soft dismount failed for {driveLetter}, retrying with Force=true");
+                                    if (DismountVolumeWmi(driveLetter, force: true))
+                                    {
+                                        thisVolumeEjected = true;
+                                        Debug.WriteLine($"[UsbStorageBlocker] Force WMI dismount succeeded for {driveLetter}");
+                                    }
+                                    else
+                                    {
+                                        // Step 3: PowerShell fallback
+                                        if (DismountVolumePs(driveLetter))
+                                        {
+                                            thisVolumeEjected = true;
+                                            Debug.WriteLine($"[UsbStorageBlocker] PowerShell dismount succeeded for {driveLetter}");
+                                        }
+                                        else
+                                        {
+                                            Debug.WriteLine($"[UsbStorageBlocker] All dismount methods failed for {driveLetter}");
+                                        }
+                                    }
+                                }
+
+                                if (thisVolumeEjected)
+                                {
+                                    // Wait up to 2 seconds for the drive letter to disappear
+                                    bool confirmed = WaitForDriveLetterGone(driveLetter, timeoutMs: 2000);
+                                    if (confirmed)
+                                    {
+                                        Debug.WriteLine($"[UsbStorageBlocker] Drive letter {driveLetter} confirmed gone");
+                                        ejected = true;
+                                    }
+                                    else
+                                    {
+                                        // Drive letter still present after dismount — log but treat as ejected
+                                        // since the dismount call succeeded; Windows may take extra time.
+                                        Debug.WriteLine($"[UsbStorageBlocker] Drive letter {driveLetter} still visible after dismount (OS may need extra time)");
+                                        ejected = true;
+                                    }
                                 }
                             }
                         }
-
-                        if (thisVolumeEjected)
+                        finally
                         {
-                            // Wait up to 2 seconds for the drive letter to disappear
-                            bool confirmed = WaitForDriveLetterGone(driveLetter, timeoutMs: 2000);
-                            if (confirmed)
-                            {
-                                Debug.WriteLine($"[UsbStorageBlocker] Drive letter {driveLetter} confirmed gone");
-                                ejected = true;
-                            }
-                            else
-                            {
-                                // Drive letter still present after dismount — log but treat as ejected
-                                // since the dismount call succeeded; Windows may take extra time.
-                                Debug.WriteLine($"[UsbStorageBlocker] Drive letter {driveLetter} still visible after dismount (OS may need extra time)");
-                                ejected = true;
-                            }
+                            logicalResults?.Dispose();
                         }
                     }
+                }
+                finally
+                {
+                    partitionResults?.Dispose();
                 }
             }
             catch (Exception ex)
@@ -259,13 +277,15 @@ namespace USBGuardian
         /// </summary>
         public bool DismountVolumeWmi(string driveLetter, bool force = false)
         {
+            ManagementObjectCollection results = null;
             try
             {
                 // Normalize: ensure trailing backslash for Win32_Volume Name
                 string volumeName = driveLetter.TrimEnd('\\') + "\\";
                 string query = $"SELECT * FROM Win32_Volume WHERE Name='{volumeName.Replace("\\", "\\\\")}'";
                 using var searcher = new ManagementObjectSearcher(query);
-                foreach (ManagementObject vol in searcher.Get())
+                results = searcher.Get();
+                foreach (ManagementObject vol in results)
                 {
                     var inParams = vol.GetMethodParameters("Dismount");
                     inParams["Force"] = force;
@@ -280,6 +300,10 @@ namespace USBGuardian
             catch (Exception ex)
             {
                 Debug.WriteLine($"[UsbStorageBlocker] DismountVolumeWmi error for {driveLetter}: {ex.Message}");
+            }
+            finally
+            {
+                results?.Dispose();
             }
             return false;
         }
@@ -400,10 +424,12 @@ namespace USBGuardian
 
         private static string FindPhysicalDrive(string vid, string pid)
         {
+            ManagementObjectCollection results = null;
             try
             {
                 using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
-                foreach (ManagementObject disk in searcher.Get())
+                results = searcher.Get();
+                foreach (ManagementObject disk in results)
                 {
                     string pnpId = disk["PNPDeviceID"]?.ToString() ?? string.Empty;
                     if (pnpId.IndexOf($"VID_{vid}&PID_{pid}", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -413,6 +439,10 @@ namespace USBGuardian
             catch (Exception ex)
             {
                 Debug.WriteLine($"[UsbStorageBlocker] FindPhysicalDrive error: {ex.Message}");
+            }
+            finally
+            {
+                results?.Dispose();
             }
             return null;
         }
