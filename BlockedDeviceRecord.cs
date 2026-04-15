@@ -26,6 +26,14 @@ namespace USBGuardian
         public string Description { get; set; } = string.Empty;
 
         /// <summary>
+        /// All InstanceIds observed for this physical device (one entry per USB port used).
+        /// The current/most-recent InstanceId is also reflected in <see cref="InstanceId"/>.
+        /// This list enables tracking the same physical device across different USB ports
+        /// without creating duplicate records.
+        /// </summary>
+        public List<string> InstanceIds { get; set; } = new();
+
+        /// <summary>
         /// Full PnP Device ID as reported by WMI Win32_PnPEntity (DeviceID field),
         /// e.g. "USB\VID_1234&amp;PID_5678\ABCDEF01".
         /// Stored at block time to allow precise WMI re-enable targeting during unblock.

@@ -972,6 +972,13 @@ namespace USBGuardian
 
             var actions = new List<BlockActionRecord>();
 
+            // 0. Eject any already-mounted volumes immediately to close the Rubberducky
+            //    attack window: the device may have been briefly accessible during the
+            //    ~795 ms Windows enumeration delay, but we dismount it as fast as possible.
+            var storageBlocker = new UsbStorageBlocker(guardianCore.EventLogger);
+            bool ejected = storageBlocker.EjectUsbVolume(device.Vid, device.Pid);
+            Debug.WriteLine($"[WhitelistEnforcement] Volume eject attempt: {(ejected ? "succeeded" : "not mounted or failed")}");
+
             // 1. Per-device ConfigFlags on the USB instance key
             string usbInstancePath =
                 $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
