@@ -362,48 +362,52 @@ namespace USBGuardian
                 UnblockResult result = _unblockManager.UnblockDevice(record);
                 Cursor = Cursors.Default;
 
-                string summary = string.Join("\n• ", result.Messages);
+                // Separate out RECOVERY_REQUIRED sentinel messages so they can be
+                // displayed clearly, but keep everything in a single dialog.
+                var recoveryItems = result.Messages
+                    .Where(m => m.StartsWith("RECOVERY_REQUIRED:", StringComparison.Ordinal))
+                    .ToList();
+                var normalMessages = result.Messages
+                    .Where(m => !m.StartsWith("RECOVERY_REQUIRED:", StringComparison.Ordinal))
+                    .ToList();
+
+                string summary = string.Join("\n• ", normalMessages);
                 string title = _unblockManager.DryRun ? "Dry Run Results" : "Unblock Results";
 
-                string replugNote = result.NeedsReplug && !_unblockManager.DryRun
-                    ? "\n\n📌 Please unplug and plug the device back in to complete recovery."
-                    : string.Empty;
+                // Build a single consolidated message so the user never sees a
+                // chained "Continue" dialog — all information is shown at once.
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"Actions performed:\n• {summary}");
 
-                MessageBox.Show(
-                    $"Actions performed:\n• {summary}{replugNote}",
-                    title,
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
+                if (result.NeedsReplug && !_unblockManager.DryRun)
+                    sb.Append("\n\n📌 The device was not yet detected after re-enumeration.\n" +
+                              "Please unplug and plug the device back in to complete recovery.");
 
-                // If any action could not restore the USBSTOR service (no recorded previous value),
-                // show a targeted recovery dialog with manual restoration instructions.
-                var recoveryItems = result.Messages
-                    .Where(r => r.StartsWith("RECOVERY_REQUIRED:", StringComparison.Ordinal))
-                    .ToList();
                 if (recoveryItems.Any())
                 {
-                    MessageBox.Show(
-                        "⚠  MANUAL RESTORATION REQUIRED  ⚠\n\n" +
-                        "USB Guardian could not automatically restore the USB Mass Storage driver " +
-                        "because no previous Start value was recorded at block time.\n\n" +
-                        "USB storage will remain unavailable until you restore it manually:\n\n" +
-                        "  1. Open Registry Editor as Administrator  (Win+R → regedit → OK)\n" +
-                        @"  2. Navigate to:  HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\usbstor" + "\n" +
-                        "  3. Double-click  Start  and set the value to  3  (Demand Start — Windows default)\n" +
-                        "  4. Click OK and close Registry Editor\n" +
-                        "  5. Restart your computer, or unplug and replug the USB device\n\n" +
-                        "Value meaning: 3 = Demand Start (Windows default)   4 = Disabled",
-                        "⚠ Manual Restoration Required",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
+                    sb.Append("\n\n⚠  MANUAL RESTORATION REQUIRED  ⚠\n\n" +
+                              "USB Guardian could not automatically restore the USB Mass Storage\n" +
+                              "driver because no previous Start value was recorded at block time.\n\n" +
+                              "USB storage will remain unavailable until you restore it manually:\n" +
+                              "  1. Open Registry Editor as Administrator  (Win+R → regedit → OK)\n" +
+                              @"  2. Navigate to:  HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\usbstor" + "\n" +
+                              "  3. Set  Start = 3  (Demand Start — Windows default)\n" +
+                              "  4. Restart your computer, or unplug and replug the USB device");
                 }
+
+                MessageBox.Show(
+                    sb.ToString(),
+                    title,
+                    MessageBoxButtons.OK,
+                    recoveryItems.Any() ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
 
                 PopulateList();
                 RefreshLegacyBanner();
                 _lblStatus.Text = _unblockManager.DryRun
                     ? $"[DRY RUN] Unblock simulated for {record.Description}"
-                    : $"Device unblocked: {record.Description}" +
-                      (result.NeedsReplug ? " (unplug/replug required)" : string.Empty);
+                    : result.NeedsReplug
+                        ? $"Device unblocked: {record.Description} — unplug/replug required"
+                        : $"Device unblocked successfully: {record.Description}";
             }
             catch (Exception ex)
             {

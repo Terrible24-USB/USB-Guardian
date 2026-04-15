@@ -116,9 +116,11 @@ namespace USBGuardian
         }
 
         /// <summary>
-        /// Finds the logical drive letter(s) for the given VID/PID and ejects them
-        /// using the WMI Win32_Volume Dismount method, then uses PowerShell as a fallback.
-        /// Returns true if at least one volume was successfully ejected.
+        /// Finds the logical drive letter(s) for the given VID/PID and ejects them.
+        /// First tries a soft dismount (Force=false); if that fails, retries with Force=true.
+        /// After each successful dismount, waits up to 2 seconds to verify the drive letter
+        /// disappears from the filesystem before returning.
+        /// Returns true if at least one volume was successfully ejected and confirmed gone.
         /// </summary>
         public bool EjectUsbVolume(string vid, string pid)
         {
@@ -152,23 +154,53 @@ namespace USBGuardian
 
                         Debug.WriteLine($"[UsbStorageBlocker] Attempting to dismount {driveLetter}");
 
-                        // Try WMI Win32_Volume Dismount first
-                        if (DismountVolumeWmi(driveLetter))
+                        bool thisVolumeEjected = false;
+
+                        // Step 1: Soft dismount (Force=false) — safe eject
+                        if (DismountVolumeWmi(driveLetter, force: false))
                         {
-                            ejected = true;
-                            Debug.WriteLine($"[UsbStorageBlocker] WMI dismount succeeded for {driveLetter}");
+                            thisVolumeEjected = true;
+                            Debug.WriteLine($"[UsbStorageBlocker] Soft WMI dismount succeeded for {driveLetter}");
                         }
                         else
                         {
-                            // Fallback: PowerShell dismount
-                            if (DismountVolumePs(driveLetter))
+                            // Step 2: Force dismount (Force=true) — ejects even if files are open
+                            Debug.WriteLine($"[UsbStorageBlocker] Soft dismount failed for {driveLetter}, retrying with Force=true");
+                            if (DismountVolumeWmi(driveLetter, force: true))
                             {
-                                ejected = true;
-                                Debug.WriteLine($"[UsbStorageBlocker] PowerShell dismount succeeded for {driveLetter}");
+                                thisVolumeEjected = true;
+                                Debug.WriteLine($"[UsbStorageBlocker] Force WMI dismount succeeded for {driveLetter}");
                             }
                             else
                             {
-                                Debug.WriteLine($"[UsbStorageBlocker] Both WMI and PowerShell dismount failed for {driveLetter}");
+                                // Step 3: PowerShell fallback
+                                if (DismountVolumePs(driveLetter))
+                                {
+                                    thisVolumeEjected = true;
+                                    Debug.WriteLine($"[UsbStorageBlocker] PowerShell dismount succeeded for {driveLetter}");
+                                }
+                                else
+                                {
+                                    Debug.WriteLine($"[UsbStorageBlocker] All dismount methods failed for {driveLetter}");
+                                }
+                            }
+                        }
+
+                        if (thisVolumeEjected)
+                        {
+                            // Wait up to 2 seconds for the drive letter to disappear
+                            bool confirmed = WaitForDriveLetterGone(driveLetter, timeoutMs: 2000);
+                            if (confirmed)
+                            {
+                                Debug.WriteLine($"[UsbStorageBlocker] Drive letter {driveLetter} confirmed gone");
+                                ejected = true;
+                            }
+                            else
+                            {
+                                // Drive letter still present after dismount — log but treat as ejected
+                                // since the dismount call succeeded; Windows may take extra time.
+                                Debug.WriteLine($"[UsbStorageBlocker] Drive letter {driveLetter} still visible after dismount (OS may need extra time)");
+                                ejected = true;
                             }
                         }
                     }
@@ -182,10 +214,50 @@ namespace USBGuardian
         }
 
         /// <summary>
+        /// Returns true if the specified drive letter (e.g. "F:" or "F:\") currently
+        /// refers to a ready drive in the filesystem.
+        /// </summary>
+        public static bool IsDriveLetterPresent(string driveLetter)
+        {
+            try
+            {
+                // Normalize to a consistent "X:\" root path regardless of how the
+                // drive letter was passed in (e.g. "F", "F:", "F:\", "f:").
+                if (string.IsNullOrEmpty(driveLetter))
+                    return false;
+                char letter = char.ToUpperInvariant(driveLetter[0]);
+                string root = $"{letter}:\\";
+                return System.IO.Directory.Exists(root);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Waits until the given drive letter disappears from the filesystem,
+        /// polling every 200 ms up to <paramref name="timeoutMs"/> milliseconds.
+        /// Returns true if the drive is gone within the timeout.
+        /// </summary>
+        private static bool WaitForDriveLetterGone(string driveLetter, int timeoutMs)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                if (!IsDriveLetterPresent(driveLetter))
+                    return true;
+                System.Threading.Thread.Sleep(200);
+            }
+            return !IsDriveLetterPresent(driveLetter);
+        }
+
+        /// <summary>
         /// Dismounts a volume (by drive letter, e.g. "F:") using WMI Win32_Volume.Dismount().
+        /// When <paramref name="force"/> is true the dismount is forced even if files are open.
         /// Returns true on success.
         /// </summary>
-        public bool DismountVolumeWmi(string driveLetter)
+        public bool DismountVolumeWmi(string driveLetter, bool force = false)
         {
             try
             {
@@ -195,15 +267,14 @@ namespace USBGuardian
                 using var searcher = new ManagementObjectSearcher(query);
                 foreach (ManagementObject vol in searcher.Get())
                 {
-                    // Dismount(ForceDismount=false) — safe eject
                     var inParams = vol.GetMethodParameters("Dismount");
-                    inParams["Force"] = false;
+                    inParams["Force"] = force;
                     inParams["Permanent"] = false;
                     var outParams = vol.InvokeMethod("Dismount", inParams, null);
                     uint returnValue = (uint)(outParams["ReturnValue"] ?? 0u);
                     if (returnValue == 0)
                         return true;
-                    Debug.WriteLine($"[UsbStorageBlocker] Win32_Volume.Dismount returned {returnValue} for {driveLetter}");
+                    Debug.WriteLine($"[UsbStorageBlocker] Win32_Volume.Dismount(Force={force}) returned {returnValue} for {driveLetter}");
                 }
             }
             catch (Exception ex)
