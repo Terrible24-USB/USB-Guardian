@@ -42,8 +42,21 @@ namespace USBGuardian
         // ---- Public API ----
 
         /// <summary>
-        /// Add a new record or replace the existing one for the same
-        /// (Vid, Pid, InstanceId) tuple. Persists immediately.
+        /// Add a new record or update the existing one for the same physical device.
+        ///
+        /// Matching strategy:
+        ///  1. When the incoming record has a non-empty <see cref="BlockedDeviceRecord.SerialNumber"/>,
+        ///     the store looks for an existing entry with the same (Vid, Pid, SerialNumber). This
+        ///     correctly deduplicates the same physical device plugged into different USB ports
+        ///     (which would otherwise produce different InstanceIds).
+        ///  2. When no SerialNumber is available, falls back to matching on (Vid, Pid, InstanceId)
+        ///     to preserve the original behaviour.
+        ///
+        /// When updating an existing record, the new InstanceId is merged into the
+        /// <see cref="BlockedDeviceRecord.InstanceIds"/> list so every port the device
+        /// has been seen on is tracked without creating separate records.
+        ///
+        /// Persists immediately.
         /// </summary>
         public void AddOrUpdate(BlockedDeviceRecord record)
         {
@@ -51,28 +64,95 @@ namespace USBGuardian
 
             lock (_lock)
             {
-                _cache.RemoveAll(r =>
-                    string.Equals(r.Vid, record.Vid, StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(r.Pid, record.Pid, StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(r.InstanceId, record.InstanceId, StringComparison.OrdinalIgnoreCase));
+                // Normalize: ensure the current InstanceId is in the InstanceIds list.
+                if (!string.IsNullOrEmpty(record.InstanceId) &&
+                    !record.InstanceIds.Contains(record.InstanceId, StringComparer.OrdinalIgnoreCase))
+                    record.InstanceIds.Add(record.InstanceId);
 
-                _cache.Add(record);
+                bool hasSerial = !string.IsNullOrEmpty(record.SerialNumber);
+
+                // Find an existing record to update (serial-number match takes priority).
+                BlockedDeviceRecord? existing = hasSerial
+                    ? _cache.FirstOrDefault(r =>
+                          string.Equals(r.Vid, record.Vid, StringComparison.OrdinalIgnoreCase) &&
+                          string.Equals(r.Pid, record.Pid, StringComparison.OrdinalIgnoreCase) &&
+                          !string.IsNullOrEmpty(r.SerialNumber) &&
+                          string.Equals(r.SerialNumber, record.SerialNumber, StringComparison.OrdinalIgnoreCase))
+                    : _cache.FirstOrDefault(r =>
+                          string.Equals(r.Vid, record.Vid, StringComparison.OrdinalIgnoreCase) &&
+                          string.Equals(r.Pid, record.Pid, StringComparison.OrdinalIgnoreCase) &&
+                          string.Equals(r.InstanceId, record.InstanceId, StringComparison.OrdinalIgnoreCase));
+
+                if (existing != null)
+                {
+                    // Merge new InstanceId(s) into the existing record so every port is tracked.
+                    foreach (string id in record.InstanceIds)
+                    {
+                        if (!string.IsNullOrEmpty(id) &&
+                            !existing.InstanceIds.Contains(id, StringComparer.OrdinalIgnoreCase))
+                            existing.InstanceIds.Add(id);
+                    }
+
+                    // Update the "current" InstanceId and other mutable fields.
+                    existing.InstanceId   = record.InstanceId;
+                    existing.PnpDeviceId  = record.PnpDeviceId;
+                    existing.Description  = record.Description;
+                    existing.Timestamp    = record.Timestamp;
+                    existing.BlockReason  = record.BlockReason;
+                    existing.Actions      = record.Actions;
+                }
+                else
+                {
+                    _cache.Add(record);
+                }
+
+                SaveToDisk();
+            }
+        }
+
+        /// <summary>
+        /// Remove a record by its unique <see cref="BlockedDeviceRecord.RecordId"/> after
+        /// the device has been successfully unblocked.  No-op if no matching record exists.
+        /// </summary>
+        public void Remove(BlockedDeviceRecord? record)
+        {
+            if (record == null) return;
+            lock (_lock)
+            {
+                _cache.RemoveAll(r => string.Equals(r.RecordId, record.RecordId, StringComparison.OrdinalIgnoreCase));
                 SaveToDisk();
             }
         }
 
         /// <summary>
         /// Remove the record for a device after it has been successfully unblocked.
+        ///
+        /// Matching strategy mirrors <see cref="AddOrUpdate"/>:
+        ///  1. When <paramref name="serialNumber"/> is non-empty, match on (Vid, Pid, SerialNumber).
+        ///  2. Otherwise, fall back to matching on (Vid, Pid, InstanceId).
+        ///
         /// No-op if no matching record exists.
         /// </summary>
-        public void Remove(string vid, string pid, string instanceId)
+        public void Remove(string vid, string pid, string instanceId, string? serialNumber = null)
         {
             lock (_lock)
             {
-                _cache.RemoveAll(r =>
-                    string.Equals(r.Vid, vid, StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(r.Pid, pid, StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(r.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+                bool hasSerial = !string.IsNullOrEmpty(serialNumber);
+                if (hasSerial)
+                {
+                    _cache.RemoveAll(r =>
+                        string.Equals(r.Vid, vid, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(r.Pid, pid, StringComparison.OrdinalIgnoreCase) &&
+                        !string.IsNullOrEmpty(r.SerialNumber) &&
+                        string.Equals(r.SerialNumber, serialNumber, StringComparison.OrdinalIgnoreCase));
+                }
+                else
+                {
+                    _cache.RemoveAll(r =>
+                        string.Equals(r.Vid, vid, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(r.Pid, pid, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(r.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+                }
                 SaveToDisk();
             }
         }
@@ -200,12 +280,72 @@ namespace USBGuardian
                     return false;
                 }
 
-                // 4. Remove and verify
-                store3.Remove("1234", "5678", "TESTINSTANCE");
+                // 4a. Deduplication by SerialNumber: same VID/PID/Serial on a different InstanceId
+                //     must NOT create a second record; instead it merges InstanceIds.
+                var store3b = new BlockedDeviceStore(path);
+                store3b.Remove(store3b.GetAll()[0]); // clear for dedup test
+
+                var recWithSerial = new BlockedDeviceRecord
+                {
+                    Vid = "AAAA",
+                    Pid = "BBBB",
+                    InstanceId = "INSTANCE_PORT_A",
+                    SerialNumber = "SERIALXYZ",
+                    Description = "Dedup Device",
+                    BlockReason = "Self-test dedup",
+                    Actions = new List<BlockActionRecord>()
+                };
+                var storeS = new BlockedDeviceStore(path);
+                storeS.AddOrUpdate(recWithSerial);
+
+                var recSameSerialNewPort = new BlockedDeviceRecord
+                {
+                    Vid = "AAAA",
+                    Pid = "BBBB",
+                    InstanceId = "INSTANCE_PORT_B",
+                    SerialNumber = "SERIALXYZ",
+                    Description = "Dedup Device (Port B)",
+                    BlockReason = "Self-test dedup port B",
+                    Actions = new List<BlockActionRecord>()
+                };
+                storeS.AddOrUpdate(recSameSerialNewPort);
+                var storeS2 = new BlockedDeviceStore(path);
+                var dedupAll = storeS2.GetAll();
+                if (dedupAll.Count != 1)
+                {
+                    Debug.WriteLine($"[BlockedDeviceStore.SelfTest] FAIL: expected 1 record after serial dedup, got {dedupAll.Count}");
+                    return false;
+                }
+                if (!dedupAll[0].InstanceIds.Contains("INSTANCE_PORT_B", StringComparer.OrdinalIgnoreCase))
+                {
+                    Debug.WriteLine("[BlockedDeviceStore.SelfTest] FAIL: port-B InstanceId was not merged into existing record");
+                    return false;
+                }
+                storeS2.Remove(storeS2.GetAll()[0]); // clean up
+
+                // 4b. No-serial fallback: different InstanceIds without SerialNumber = separate records.
+                var storeF = new BlockedDeviceStore(path);
+                var recNoSerial1 = new BlockedDeviceRecord { Vid = "1111", Pid = "2222", InstanceId = "INST1", BlockReason = "t" };
+                var recNoSerial2 = new BlockedDeviceRecord { Vid = "1111", Pid = "2222", InstanceId = "INST2", BlockReason = "t" };
+                storeF.AddOrUpdate(recNoSerial1);
+                storeF.AddOrUpdate(recNoSerial2);
+                var storeF2 = new BlockedDeviceStore(path);
+                if (storeF2.GetAll().Count != 2)
+                {
+                    Debug.WriteLine($"[BlockedDeviceStore.SelfTest] FAIL: expected 2 records for different InstanceIds without serial, got {storeF2.GetAll().Count}");
+                    return false;
+                }
+                foreach (var r in storeF2.GetAll()) storeF2.Remove(r); // clean up
+
+                // 4c. Remove-by-record and verify
+                var storeR = new BlockedDeviceStore(path);
+                storeR.AddOrUpdate(rec);
+                var toRemove = storeR.GetAll()[0];
+                storeR.Remove(toRemove);
                 var store4 = new BlockedDeviceStore(path);
                 if (store4.GetAll().Count != 0)
                 {
-                    Debug.WriteLine("[BlockedDeviceStore.SelfTest] FAIL: remove did not delete the record");
+                    Debug.WriteLine("[BlockedDeviceStore.SelfTest] FAIL: Remove(record) did not delete the record");
                     return false;
                 }
 

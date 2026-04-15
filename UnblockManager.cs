@@ -151,7 +151,7 @@ namespace USBGuardian
 
             // Remove from the store so it no longer appears in the unblock list
             if (!DryRun)
-                _store.Remove(record.Vid, record.Pid, record.InstanceId);
+                _store.Remove(record);
 
             return result;
         }
@@ -425,6 +425,8 @@ namespace USBGuardian
                         using var searcher = new ManagementObjectSearcher(wql);
                         foreach (ManagementObject obj in searcher.Get())
                         {
+                            if (obj == null) continue;
+
                             string devId = obj["DeviceID"]?.ToString() ?? string.Empty;
                             if (!alreadySeen.Add(devId)) continue;
 
@@ -436,7 +438,13 @@ namespace USBGuardian
                             }
                             catch (Exception ex)
                             {
-                                Debug.WriteLine($"[UnblockManager] WMI Enable failed for {devId}: {ex.Message}");
+                                // Log visibly — this is a non-fatal error (device may already be
+                                // active or temporarily unavailable).  We continue enabling other
+                                // nodes rather than aborting the entire unblock operation.
+                                string msg = $"WMI Enable failed for '{devId}': {ex.Message} " +
+                                             "(device may already be active or temporarily absent — this is usually harmless)";
+                                Debug.WriteLine($"[UnblockManager] {msg}");
+                                _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
                             }
 
                             if (exact) break; // only need one result for exact-match queries
