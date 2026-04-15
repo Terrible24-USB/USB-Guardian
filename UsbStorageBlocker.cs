@@ -139,23 +139,23 @@ namespace USBGuardian
 
                 // Walk partitions → logical disks to get drive letters
                 string partitionQuery = $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{physicalDrive}'}} WHERE AssocClass=Win32_DiskDriveToDiskPartition";
-                ManagementObjectCollection partResults = null;
+                ManagementObjectCollection partitionResults = null;
                 try
                 {
                     using var partSearcher = new ManagementObjectSearcher(partitionQuery);
-                    partResults = partSearcher.Get();
-                    foreach (ManagementObject partition in partResults)
+                    partitionResults = partSearcher.Get();
+                    foreach (ManagementObject partition in partitionResults)
                     {
                         string partId = partition["DeviceID"]?.ToString();
                         if (string.IsNullOrEmpty(partId)) continue;
 
                         string logicalQuery = $"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{partId}'}} WHERE AssocClass=Win32_LogicalDiskToPartition";
-                        ManagementObjectCollection logResults = null;
+                        ManagementObjectCollection logicalResults = null;
                         try
                         {
                             using var logSearcher = new ManagementObjectSearcher(logicalQuery);
-                            logResults = logSearcher.Get();
-                            foreach (ManagementObject logical in logResults)
+                            logicalResults = logSearcher.Get();
+                            foreach (ManagementObject logical in logicalResults)
                             {
                                 string driveLetter = logical["DeviceID"]?.ToString(); // e.g., "F:"
                                 if (string.IsNullOrEmpty(driveLetter)) continue;
@@ -215,13 +215,13 @@ namespace USBGuardian
                         }
                         finally
                         {
-                            logResults?.Dispose();
+                            logicalResults?.Dispose();
                         }
                     }
                 }
                 finally
                 {
-                    partResults?.Dispose();
+                    partitionResults?.Dispose();
                 }
             }
             catch (Exception ex)
