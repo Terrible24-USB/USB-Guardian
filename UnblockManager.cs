@@ -515,14 +515,44 @@ namespace USBGuardian
                         {
                             if (obj == null) continue;
 
-                            string devId = obj["DeviceID"]?.ToString() ?? string.Empty;
-                            if (!alreadySeen.Add(devId)) continue;
-
+                            // devId is declared outside the try so it is accessible in catch blocks
+                            // even if the DeviceID property retrieval itself throws.
+                            string devId = "<unknown>";
                             try
                             {
+                                devId = obj["DeviceID"]?.ToString() ?? string.Empty;
+                                if (!alreadySeen.Add(devId)) continue;
+
                                 obj.InvokeMethod("Enable", null);
                                 enabled.Add(devId);
                                 Debug.WriteLine($"[UnblockManager] Enabled via WMI: {devId}");
+                            }
+                            catch (ManagementException ex) when (
+                                ex.ErrorCode == ManagementStatus.NotFound ||
+                                ex.ErrorCode == ManagementStatus.InvalidObject ||
+                                ex.ErrorCode == ManagementStatus.InvalidQuery)
+                            {
+                                // These three codes indicate the WMI object is stale or the device
+                                // is gone.  Other ManagementException codes (e.g. AccessDenied) fall
+                                // through to the general handler below.
+                                string msg = $"WMI Enable skipped for '{devId}': device no longer available " +
+                                             $"(WMI status: {ex.ErrorCode})";
+                                Debug.WriteLine($"[UnblockManager] {msg}");
+                                _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                continue;
+                            }
+                            catch (NullReferenceException ex)
+                            {
+                                // The underlying WMI COM object was released or became invalid
+                                // between the query and the Enable call (e.g. device unplugged in
+                                // the interim).  Catching NullReferenceException is intentional
+                                // here: WMI COM interop can surface a null RCW that cannot be
+                                // guarded against with a simple reference null-check.
+                                string msg = $"WMI object became null for '{devId}': {ex.Message} — " +
+                                             "device may have been disconnected; skipping this node";
+                                Debug.WriteLine($"[UnblockManager] {msg}");
+                                _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                continue;
                             }
                             catch (Exception ex)
                             {
@@ -533,6 +563,7 @@ namespace USBGuardian
                                              "(device may already be active or temporarily absent — this is usually harmless)";
                                 Debug.WriteLine($"[UnblockManager] {msg}");
                                 _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                continue;
                             }
 
                             if (exact) break; // only need one result for exact-match queries
