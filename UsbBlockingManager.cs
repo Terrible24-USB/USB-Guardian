@@ -42,7 +42,7 @@ namespace USBGuardian
                 ManagementObjectCollection results = null;
                 try
                 {
-                    var searcher = new ManagementObjectSearcher(query);
+                    using var searcher = new ManagementObjectSearcher(query);
                     results = searcher.Get();
                     foreach (ManagementObject obj in results)
                     {
@@ -143,7 +143,7 @@ namespace USBGuardian
                 ManagementObjectCollection results = null;
                 try
                 {
-                    var searcher = new ManagementObjectSearcher(query);
+                    using var searcher = new ManagementObjectSearcher(query);
                     results = searcher.Get();
                     foreach (ManagementObject obj in results)
                     {

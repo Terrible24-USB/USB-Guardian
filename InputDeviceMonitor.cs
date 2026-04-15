@@ -114,7 +114,7 @@ namespace USBGuardian
             ManagementObjectCollection results = null;
             try
             {
-                var searcher = new ManagementObjectSearcher(
+                using var searcher = new ManagementObjectSearcher(
                     "SELECT * FROM Win32_PnPEntity WHERE PNPClass='Keyboard' OR PNPClass='Mouse'");
                 results = searcher.Get();
                 foreach (ManagementObject obj in results)

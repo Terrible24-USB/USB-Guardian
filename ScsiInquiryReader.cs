@@ -24,7 +24,7 @@ public static class ScsiInquiryReader
         ManagementObjectCollection results = null;
         try
         {
-            var searcher = new ManagementObjectSearcher(
+            using var searcher = new ManagementObjectSearcher(
                 "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
             results = searcher.Get();
             foreach (ManagementObject drive in results)

@@ -200,7 +200,7 @@ namespace USBGuardian
                     ManagementObjectCollection exactResults = null;
                     try
                     {
-                        var exact = new ManagementObjectSearcher(exactWql);
+                        using var exact = new ManagementObjectSearcher(exactWql);
                         exactResults = exact.Get();
                         foreach (ManagementObject obj in exactResults)
                         {
@@ -221,7 +221,7 @@ namespace USBGuardian
                 ManagementObjectCollection broadResults = null;
                 try
                 {
-                    var broad = new ManagementObjectSearcher(broadWql);
+                    using var broad = new ManagementObjectSearcher(broadWql);
                     broadResults = broad.Get();
                     foreach (ManagementObject obj in broadResults)
                     {
@@ -509,7 +509,7 @@ namespace USBGuardian
                     ManagementObjectCollection results = null;
                     try
                     {
-                        var searcher = new ManagementObjectSearcher(wql);
+                        using var searcher = new ManagementObjectSearcher(wql);
                         results = searcher.Get();
                         foreach (ManagementObject obj in results)
                         {

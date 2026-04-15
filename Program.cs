@@ -789,7 +789,7 @@ namespace USBGuardian
                         System.Management.ManagementObjectCollection wmiResults = null;
                         try
                         {
-                            var searcher = new System.Management.ManagementObjectSearcher(wmiQuery);
+                            using var searcher = new System.Management.ManagementObjectSearcher(wmiQuery);
                             wmiResults = searcher.Get();
                             foreach (System.Management.ManagementObject obj in wmiResults)
                             {
@@ -943,7 +943,7 @@ namespace USBGuardian
                 ManagementObjectCollection results = null;
                 try
                 {
-                    var searcher = new ManagementObjectSearcher(wql);
+                    using var searcher = new ManagementObjectSearcher(wql);
                     results = searcher.Get();
                     foreach (ManagementObject obj in results)
                     {
@@ -1545,7 +1545,7 @@ namespace USBGuardian
                     ManagementObjectCollection diskResults = null;
                     try
                     {
-                        var searcher = new ManagementObjectSearcher(
+                        using var searcher = new ManagementObjectSearcher(
                             "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
                         diskResults = searcher.Get();
                         foreach (ManagementObject disk in diskResults)
@@ -1570,7 +1570,7 @@ namespace USBGuardian
                     ManagementObjectCollection partResults = null;
                     try
                     {
-                        var partitionSearcher = new ManagementObjectSearcher(
+                        using var partitionSearcher = new ManagementObjectSearcher(
                             $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{physicalDrive}'}} WHERE AssocClass=Win32_DiskDriveToDiskPartition");
                         partResults = partitionSearcher.Get();
                         foreach (ManagementObject partition in partResults)
@@ -1583,7 +1583,7 @@ namespace USBGuardian
                             ManagementObjectCollection logicalResults = null;
                             try
                             {
-                                var logicalSearcher = new ManagementObjectSearcher(
+                                using var logicalSearcher = new ManagementObjectSearcher(
                                     $"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{partitionDeviceId}'}} WHERE AssocClass=Win32_LogicalDiskToPartition");
                                 logicalResults = logicalSearcher.Get();
                                 foreach (ManagementObject logical in logicalResults)
@@ -1616,7 +1616,7 @@ namespace USBGuardian
                 ManagementObjectCollection results = null;
                 try
                 {
-                    var searcher = new ManagementObjectSearcher(
+                    using var searcher = new ManagementObjectSearcher(
                         "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
                     results = searcher.Get();
                     foreach (ManagementObject disk in results)
@@ -1902,7 +1902,7 @@ namespace USBGuardian
                         ManagementObjectCollection diskResults = null;
                         try
                         {
-                            var searcher = new ManagementObjectSearcher(
+                            using var searcher = new ManagementObjectSearcher(
                                 "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
                             diskResults = searcher.Get();
                             foreach (ManagementObject disk in diskResults)
@@ -2715,7 +2715,7 @@ namespace USBGuardian
                 ManagementObjectCollection results = null;
                 try
                 {
-                    var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_LogicalDisk WHERE DriveType=2");
+                    using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_LogicalDisk WHERE DriveType=2");
                     results = searcher.Get();
                     foreach (ManagementObject disk in results)
                     {

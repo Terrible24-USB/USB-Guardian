@@ -142,7 +142,7 @@ namespace USBGuardian
                 ManagementObjectCollection partResults = null;
                 try
                 {
-                    var partSearcher = new ManagementObjectSearcher(partitionQuery);
+                    using var partSearcher = new ManagementObjectSearcher(partitionQuery);
                     partResults = partSearcher.Get();
                     foreach (ManagementObject partition in partResults)
                     {
@@ -153,7 +153,7 @@ namespace USBGuardian
                         ManagementObjectCollection logResults = null;
                         try
                         {
-                            var logSearcher = new ManagementObjectSearcher(logicalQuery);
+                            using var logSearcher = new ManagementObjectSearcher(logicalQuery);
                             logResults = logSearcher.Get();
                             foreach (ManagementObject logical in logResults)
                             {
@@ -283,7 +283,7 @@ namespace USBGuardian
                 // Normalize: ensure trailing backslash for Win32_Volume Name
                 string volumeName = driveLetter.TrimEnd('\\') + "\\";
                 string query = $"SELECT * FROM Win32_Volume WHERE Name='{volumeName.Replace("\\", "\\\\")}'";
-                var searcher = new ManagementObjectSearcher(query);
+                using var searcher = new ManagementObjectSearcher(query);
                 results = searcher.Get();
                 foreach (ManagementObject vol in results)
                 {
@@ -427,7 +427,7 @@ namespace USBGuardian
             ManagementObjectCollection results = null;
             try
             {
-                var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
+                using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
                 results = searcher.Get();
                 foreach (ManagementObject disk in results)
                 {
