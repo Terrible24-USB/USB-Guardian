@@ -79,11 +79,14 @@ namespace USBGuardian
                     result.Success = true;
                     result.Message = $"Set ConfigFlags disabled on {subKeyPath}";
 
+                    // Strip Guardian's own bits before recording so that the rollback
+                    // target is the true pre-Guardian state, even if an early-block step
+                    // already applied these flags before this call ran.
                     actionLog?.Add(new BlockActionRecord
                     {
                         ActionType = "ConfigFlags",
                         RegistryPath = subKeyPath,
-                        PreviousConfigFlags = previousFlags
+                        PreviousConfigFlags = previousFlags & ~(ConfigFlagDisabled | ConfigFlagReinstall)
                     });
                 }
                 else
