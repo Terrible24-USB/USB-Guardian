@@ -18,10 +18,15 @@ namespace USBGuardian
         private const int ConfigFlagDisabled = 0x100;   // CONFIGFLAG_DISABLED
         private const int ConfigFlagReinstall = 0x40;   // CONFIGFLAG_REINSTALL (prevents auto re-install)
 
-        // cfgmgr32 constants for device re-enumeration
-        private const int  CM_CR_SUCCESS               = 0;
-        private const uint CM_LOCATE_DEVNODE_NORMAL_WL = 0;
-        private const uint CM_REENUMERATE_NORMAL_WL    = 0;
+        // cfgmgr32 constants for device re-enumeration (_WL = Windows-standard flag value of zero)
+        private const int  CM_CR_SUCCESS              = 0;
+        private const uint CM_LOCATE_DEVNODE_NORMAL   = 0;
+        private const uint CM_REENUMERATE_NORMAL      = 0;
+
+        // Time to wait after triggering cfgmgr32 re-enumeration before attempting eject.
+        // Windows needs ~500–800 ms to process the ConfigFlags disable bits and tear down
+        // the device node; 600 ms is a safe middle-ground that avoids the re-mount race.
+        private const int ReEnumerationDelayMs = 600;
 
         [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
         private static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string? pDeviceID, uint ulFlags);
@@ -103,7 +108,7 @@ namespace USBGuardian
 
                 // Step 3: Wait for Windows to process the re-enumeration and apply the
                 // ConfigFlags, giving the OS time to tear down the device node.
-                Thread.Sleep(600);
+                Thread.Sleep(ReEnumerationDelayMs);
 
                 // Step 4: Eject any still-mounted volumes (the drive may already be gone
                 // because ConfigFlags prevented re-mount, so a failure here is expected
@@ -458,10 +463,10 @@ namespace USBGuardian
         {
             try
             {
-                int cr = CM_Locate_DevNodeW(out uint rootInst, null, CM_LOCATE_DEVNODE_NORMAL_WL);
+                int cr = CM_Locate_DevNodeW(out uint rootInst, null, CM_LOCATE_DEVNODE_NORMAL);
                 if (cr == CM_CR_SUCCESS)
                 {
-                    CM_Reenumerate_DevNode(rootInst, CM_REENUMERATE_NORMAL_WL);
+                    CM_Reenumerate_DevNode(rootInst, CM_REENUMERATE_NORMAL);
                     Debug.WriteLine($"[UsbStorageBlocker] Triggered cfgmgr32 re-enumeration for {vidPid}");
                 }
                 else
