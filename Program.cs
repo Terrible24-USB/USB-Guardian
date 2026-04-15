@@ -385,6 +385,15 @@ namespace USBGuardian
 
             try
             {
+                // EARLY BLOCK ─────────────────────────────────────────────────────────────
+                // Apply ConfigFlags disable bits on the USB instance key right now, before
+                // the slow fingerprint capture (WMI, SCSI IOCTL, USB hub IOCTLs) runs.
+                // This shrinks the window during which an unapproved drive is mounted from
+                // ~150–400 ms down to the few milliseconds it takes for a single registry
+                // read/write + cfgmgr32 rescan.  The block is reversed automatically if the
+                // full fingerprint later confirms the device is whitelisted.
+                bool earlyBlockApplied = EarlyBlockUsbInstanceKey(vid, pid, instanceId);
+
                 // Capture all identifiers
                 DeviceFingerprint currentDevice = deviceIdentifier.CaptureAllIdentifiers(
                     devicePath, vid, pid, instanceId);
@@ -432,6 +441,35 @@ namespace USBGuardian
 
                 if (isAllowed)
                 {
+                    // If an early ConfigFlags block was applied before fingerprint capture,
+                    // and the full fingerprint now confirms the device is whitelisted,
+                    // clear the block bits so the drive becomes accessible again.
+                    if (earlyBlockApplied)
+                    {
+                        try
+                        {
+                            string earlyRegPath =
+                                $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{vid}&PID_{pid}\{instanceId}";
+                            using var earlyKey =
+                                Registry.LocalMachine.OpenSubKey(earlyRegPath, writable: true);
+                            if (earlyKey != null)
+                            {
+                                int cv = earlyKey.GetValue("ConfigFlags") is int f ? f : 0;
+                                earlyKey.SetValue("ConfigFlags",
+                                    cv & ~(ConfigFlagDisabled | ConfigFlagReinstall),
+                                    RegistryValueKind.DWord);
+                            }
+                            TriggerRescanForBlock($"{vid}:{pid}");
+                            Debug.WriteLine(
+                                $"[EarlyBlock] Reversed early block for whitelisted device {vid}:{pid}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine(
+                                $"[EarlyBlock] Failed to reverse early block for {vid}:{pid}: {ex.Message}");
+                        }
+                    }
+
                     Debug.WriteLine("✅ DEVICE ALLOWED - Found in whitelist");
                     matchedDevice.LastConnectedTime = DateTime.UtcNow;
                     SaveWhitelist();
@@ -821,11 +859,14 @@ namespace USBGuardian
                 int previous = (int)(key.GetValue("ConfigFlags", 0) ?? 0);
                 key.SetValue("ConfigFlags", previous | flags, RegistryValueKind.DWord);
                 Debug.WriteLine($"{deviceLabel} disabled via registry (ConfigFlags |= 0x{flags:X}): {instancePath}");
+                // Record the true pre-Guardian state: strip Guardian's own bits before
+                // saving so that the rollback target is correct even when an early-block
+                // step has already applied those bits before this call runs.
                 actionLog.Add(new BlockActionRecord
                 {
                     ActionType = "ConfigFlags",
                     RegistryPath = instancePath,
-                    PreviousConfigFlags = previous
+                    PreviousConfigFlags = previous & ~(ConfigFlagDisabled | ConfigFlagReinstall)
                 });
             }
             else
@@ -937,6 +978,90 @@ namespace USBGuardian
             catch (Exception ex)
             {
                 Debug.WriteLine($"[WhitelistEnforcement] cfgmgr32 rescan failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Applies ConfigFlags disable bits on the USB device-instance registry key and
+        /// triggers a cfgmgr32 hardware rescan as early as possible — BEFORE the slow
+        /// fingerprint capture and 6-layer evaluation run.
+        ///
+        /// This significantly reduces the window during which an unapproved USB storage
+        /// device is mounted and readable.  Windows mounts the volume before the
+        /// WM_DEVICECHANGE message is delivered, so complete zero-latency prevention is
+        /// only achievable with a kernel filter driver; this is the best user-mode effort.
+        ///
+        /// Only fires when all of the following are true:
+        ///   1. The device's registry Service value is "usbstor" or "disk".
+        ///   2. No whitelist entry already carries this VID/PID — if the VID/PID is
+        ///      known the full fingerprint-based Matches() check decides admission and
+        ///      we avoid a spurious block on a legitimate re-insertion.
+        ///   3. The device registry key is present and writable.
+        ///
+        /// Returns true if the early block was applied so the caller can reverse it
+        /// when the full fingerprint confirms the device is whitelisted.
+        /// </summary>
+        private bool EarlyBlockUsbInstanceKey(string vid, string pid, string instanceId)
+        {
+            try
+            {
+                string regPath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{vid}&PID_{pid}\{instanceId}";
+
+                string serviceName;
+                using (var key = Registry.LocalMachine.OpenSubKey(regPath))
+                {
+                    if (key == null)
+                        return false;
+                    serviceName = key.GetValue("Service")?.ToString();
+                }
+
+                bool isStorage =
+                    string.Equals(serviceName, "usbstor", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(serviceName, "disk",    StringComparison.OrdinalIgnoreCase);
+
+                if (!isStorage)
+                    return false;
+
+                // If any whitelist entry shares this VID/PID, skip the early block and let
+                // the full fingerprint-based Matches() decide — avoids briefly blocking a
+                // re-inserted device that is already whitelisted.
+                bool vidPidKnown = whitelist.Any(w =>
+                    string.Equals(w.Vid, vid, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(w.Pid, pid, StringComparison.OrdinalIgnoreCase));
+
+                if (vidPidKnown)
+                    return false;
+
+                // Apply ConfigFlags disable bits immediately (single registry write).
+                using (var key = Registry.LocalMachine.OpenSubKey(regPath, writable: true))
+                {
+                    if (key == null)
+                        return false;
+
+                    int current = key.GetValue("ConfigFlags") is int f ? f : 0;
+                    key.SetValue("ConfigFlags",
+                        current | ConfigFlagDisabled | ConfigFlagReinstall,
+                        RegistryValueKind.DWord);
+                }
+
+                // Ask Windows to drop the now-disabled device node without waiting for a replug.
+                TriggerRescanForBlock($"{vid}:{pid}");
+
+                guardianCore?.EventLogger?.LogCritical(0, "EarlyBlock",
+                    $"Early ConfigFlags block applied for unknown storage device " +
+                    $"VID_{vid}&PID_{pid} (InstanceId={instanceId}) before fingerprint capture. " +
+                    "Block will be reversed automatically if the device is subsequently whitelisted.",
+                    $"{vid}:{pid}");
+
+                Debug.WriteLine(
+                    $"[EarlyBlock] ConfigFlags + rescan applied for {vid}:{pid} at {DateTime.UtcNow:o}");
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[EarlyBlock] EarlyBlockUsbInstanceKey failed: {ex.Message}");
+                return false;
             }
         }
 

@@ -281,11 +281,13 @@ namespace USBGuardian
                         success = true;
                         Debug.WriteLine($"[UsbStorageBlocker] Set ConfigFlags on {usbInstancePath}");
 
+                        // Strip Guardian's own bits so the rollback target is the true
+                        // pre-Guardian state even if an early-block step ran first.
                         actionLog?.Add(new BlockActionRecord
                         {
                             ActionType = "ConfigFlags",
                             RegistryPath = usbInstancePath,
-                            PreviousConfigFlags = previous
+                            PreviousConfigFlags = previous & ~(ConfigFlagDisabled | ConfigFlagReinstall)
                         });
                     }
                 }
@@ -303,11 +305,13 @@ namespace USBGuardian
                         success = true;
                         Debug.WriteLine($"[UsbStorageBlocker] Set ConfigFlags on USBSTOR path: {usbStorPath}");
 
+                        // Strip Guardian's own bits so the rollback target is the true
+                        // pre-Guardian state even if an early-block step ran first.
                         actionLog?.Add(new BlockActionRecord
                         {
                             ActionType = "ConfigFlags",
                             RegistryPath = usbStorPath,
-                            PreviousConfigFlags = previous
+                            PreviousConfigFlags = previous & ~(ConfigFlagDisabled | ConfigFlagReinstall)
                         });
                     }
                 }
