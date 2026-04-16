@@ -12,14 +12,17 @@ namespace USBGuardian
         private readonly FirmwareIntegrityMonitor _firmwareIntegrityMonitor;
         private readonly ThreatIsolationManager _threatIsolationManager;
         private readonly ForensicsLogger _forensicsLogger;
+        private readonly DeviceWhitelistManager _whitelistManager;
+        private readonly TemporaryDeviceEnablerManager _temporaryDeviceEnabler;
 
         public UsbGuardianSecurityEngine(SecurityEventLogger eventLogger, UsbBlockingManager blockingManager)
         {
             _eventLogger = eventLogger;
-            var whitelistManager = new DeviceWhitelistManager();
+            _whitelistManager = new DeviceWhitelistManager();
+            _temporaryDeviceEnabler = new TemporaryDeviceEnablerManager(eventLogger, _whitelistManager);
             _forensicsLogger = new ForensicsLogger();
             _identityValidator = new DeviceIdentityValidator(eventLogger);
-            _classHardener = new DeviceClassHardener(eventLogger, whitelistManager);
+            _classHardener = new DeviceClassHardener(eventLogger, _whitelistManager);
             _keystrokeMonitor = new RealTimeKeystrokeMonitor(eventLogger);
             _firmwareIntegrityMonitor = new FirmwareIntegrityMonitor(eventLogger);
             _threatIsolationManager = new ThreatIsolationManager(eventLogger, blockingManager, _forensicsLogger);
@@ -75,6 +78,17 @@ namespace USBGuardian
         public void StartKeystrokeMonitoring(string vidPid) => _keystrokeMonitor.StartMonitoring(vidPid);
 
         public KeystrokeThreatResult EvaluateKeystrokeThreat(string vidPid) => _keystrokeMonitor.AnalyzeRealtime(vidPid);
+
+        public bool IsWhitelisted(DeviceFingerprint fingerprint) => _whitelistManager.IsWhitelisted(fingerprint);
+
+        public void ApproveWhitelisted(DeviceFingerprint fingerprint, string approvedBy = "admin") =>
+            _whitelistManager.Approve(fingerprint, approvedBy);
+
+        public bool TemporarilyEnableUsbStorage(DeviceFingerprint fingerprint, int enableDurationSeconds = 60)
+        {
+            string vidPid = $"{fingerprint.Vid}:{fingerprint.Pid}";
+            return _temporaryDeviceEnabler.TemporarilyEnableUsbStorage(vidPid, enableDurationSeconds);
+        }
 
         private static IEnumerable<string> BuildReasons(
             IdentityValidationResult identity,
