@@ -85,10 +85,16 @@ namespace USBGuardian
             string vidPid = $"{device.Vid}:{device.Pid}";
             bool anySuccess = false;
             var actions = new List<BlockActionRecord>();
+            var deviceInfo = new DeviceInformationCollector().Collect(device);
 
             try
             {
                 _logger.LogAttack(0, "StorageBlock", $"Blocking USB storage device {vidPid}", vidPid);
+                _logger.LogCritical(0, "StorageBlockInfo",
+                    $"Preparing per-device block for {deviceInfo.VidPid} " +
+                    $"(Manufacturer={deviceInfo.Manufacturer}, Product={deviceInfo.ProductName}, Serial={deviceInfo.SerialNumber ?? "N/A"}, " +
+                    $"DescriptorHash={deviceInfo.DescriptorHash}). Global USBSTOR service is not disabled.",
+                    vidPid);
 
                 // Step 1: Set registry flags FIRST to prevent re-enumeration.
                 // ConfigFlags must be written before Windows re-enumerates so that

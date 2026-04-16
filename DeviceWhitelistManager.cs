@@ -63,6 +63,18 @@ namespace USBGuardian
             }
         }
 
+        public int EntryCount
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    PurgeExpiredLocked();
+                    return _entries.Count;
+                }
+            }
+        }
+
         private void PurgeExpiredLocked()
         {
             var expired = _entries

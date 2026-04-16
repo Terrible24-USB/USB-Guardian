@@ -15,10 +15,14 @@ namespace USBGuardian
             try
             {
                 logger?.LogPreBootAction("Initialize", "Initializing pre-boot USB storage blocking.");
+                var whitelist = new DeviceWhitelist();
+                logger?.LogPreBootAction("Initialize",
+                    $"Loaded device whitelist entries: {whitelist.CountTrustedEntries()}");
                 ServiceHardeningManager.DisableUsbStorageSurface(logger);
                 DisableAllUsbStorInstances(logger);
                 CreatePreBootLockFile(logger);
-                logger?.LogPreBootAction("Initialize", "Pre-boot USB storage blocking applied.");
+                logger?.LogPreBootAction("Initialize",
+                    "Pre-boot monitoring initialized. Per-device ConfigFlags blocking active for unknown USBSTOR instances; global USBSTOR service remains unchanged.");
             }
             catch (Exception ex)
             {

@@ -105,6 +105,7 @@ namespace USBGuardian
         private UnblockManager unblockManager;
         private NotifyIcon trayIcon;
         private EmergencyRecoveryManager emergencyRecoveryManager;
+        private IntelligentUsbBlocker intelligentUsbBlocker;
 
         public USBMessageWindow()
         {
@@ -127,6 +128,7 @@ namespace USBGuardian
             // Initialize the redesigned security engine core
             guardianCore = new UsbGuardianCore();
             _ = guardianCore.InitializeAsync();
+            intelligentUsbBlocker = guardianCore.IntelligentUsbBlocker;
 
             // Initialize the blocked-device store and unblock manager
             blockedDeviceStore = new BlockedDeviceStore();
@@ -499,7 +501,7 @@ namespace USBGuardian
                     }
 
                     Debug.WriteLine("❌ DEVICE NOT IN WHITELIST");
-                    HandleUnknownDevice(currentDevice);
+                    HandleUnknownDevice(currentDevice, evalResult);
                 }
             }
             catch (Exception ex)
@@ -508,7 +510,7 @@ namespace USBGuardian
             }
         }
 
-        private void HandleUnknownDevice(DeviceFingerprint device)
+        private void HandleUnknownDevice(DeviceFingerprint device, DeviceEvaluationResult? evaluationResult = null)
         {
             LogUnknownDevice(device);
 
@@ -533,167 +535,78 @@ namespace USBGuardian
             if (!mightBeBuiltIn && UsbStorageBlocker.IsUsbStorageDevice(device))
                 preBlockRecord = ImmediateBlockForWhitelistEnforcement(device);
 
-            using (var form = new Form())
+            if (mightBeBuiltIn)
             {
-                form.Text = "USB Guardian - Unknown Device Detected";
-                form.Size = new Size(500, mightBeBuiltIn ? 440 : 400);
-                form.StartPosition = FormStartPosition.CenterScreen;
-                form.FormBorderStyle = FormBorderStyle.FixedDialog;
-                form.MaximizeBox = false;
-                form.MinimizeBox = false;
+                var builtInResult = MessageBox.Show(
+                    "This device might be an internal component.\n\n" +
+                    "For safety, USB Guardian recommends allowing it unless you are certain it is external malicious hardware.\n\n" +
+                    "Allow this device?",
+                    "USB Guardian - Possible Built-In Device",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button1);
 
-                string titleText = mightBeBuiltIn
-                    ? "⚠ Possibly Built-In Device Detected"
-                    : "⚠ Unknown USB Device Detected";
-
-                var lblTitle = new Label
+                if (builtInResult == DialogResult.Yes)
                 {
-                    Text = titleText,
-                    Font = new Font("Arial", 12, FontStyle.Bold),
-                    ForeColor = mightBeBuiltIn ? Color.DarkOrange : SystemColors.ControlText,
-                    Location = new Point(20, 20),
-                    Size = new Size(450, 30),
-                    TextAlign = ContentAlignment.MiddleCenter
-                };
-
-                int detailsTop = 60;
-                int detailsHeight = 200;
-
-                Label lblWarning = null;
-                if (mightBeBuiltIn)
-                {
-                    lblWarning = new Label
-                    {
-                        Text = "⚠ WARNING: This device may be an internal laptop component (keyboard, mouse, or trackpad). " +
-                               "Blocking it could render your device unusable.",
-                        Font = new Font("Arial", 9, FontStyle.Bold),
-                        ForeColor = Color.DarkOrange,
-                        BackColor = Color.LightYellow,
-                        Location = new Point(20, 55),
-                        Size = new Size(450, 50),
-                        TextAlign = ContentAlignment.MiddleLeft
-                    };
-                    detailsTop = 115;
-                    detailsHeight = 170;
-                }
-
-                var txtDetails = new TextBox
-                {
-                    Location = new Point(20, detailsTop),
-                    Size = new Size(450, detailsHeight),
-                    Multiline = true,
-                    ReadOnly = true,
-                    ScrollBars = ScrollBars.Vertical,
-                    Text = GetDeviceDetailsText(device)
-                };
-
-                int btnTop = detailsTop + detailsHeight + 20;
-
-                var btnAllow = new Button
-                {
-                    Text = "Allow This Device",
-                    Location = new Point(20, btnTop),
-                    Size = new Size(140, 40),
-                    BackColor = Color.LightGreen
-                };
-
-                var btnBlock = new Button
-                {
-                    Text = "Block Device",
-                    Location = new Point(180, btnTop),
-                    Size = new Size(140, 40),
-                    BackColor = Color.LightCoral,
-                    Enabled = !mightBeBuiltIn
-                };
-
-                var btnAllowAlways = new Button
-                {
-                    Text = "Allow & Add to Whitelist",
-                    Location = new Point(340, btnTop),
-                    Size = new Size(140, 40),
-                    BackColor = Color.LightBlue
-                };
-
-                var chkRemember = new CheckBox
-                {
-                    Text = "Remember this device (add to whitelist)",
-                    Location = new Point(20, btnTop + 50),
-                    Size = new Size(300, 30),
-                    Checked = true
-                };
-
-                btnAllow.Click += (s, e) =>
-                {
-                    // If the device was immediately blocked, reverse the block before allowing it
-                    if (preBlockRecord != null)
-                    {
-                        try { unblockManager.UnblockDevice(preBlockRecord); }
-                        catch (Exception ex)
-                        {
-                            Debug.WriteLine(
-                                $"[HandleUnknownDevice] Pre-block reversal failed: {ex.Message}");
-                        }
-                    }
-                    if (chkRemember.Checked)
-                    {
-                        guardianCore.ApproveWhitelist(device);
-                        whitelist.Add(device);
-                        SaveWhitelist();
-                        historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User chose Allow & Remember");
-                        ShowBalloonTip("Device Whitelisted",
-                            $"{device.Description} has been added to the whitelist.");
-                    }
-
                     if (UsbStorageBlocker.IsUsbStorageDevice(device))
                         guardianCore.TemporarilyEnableUsbStorage(device, 60);
-                    form.DialogResult = DialogResult.OK;
-                    form.Close();
-                };
+                    historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User allowed possible built-in device");
+                }
+                return;
+            }
 
-                btnBlock.Click += (s, e) =>
-                {
-                    // If not yet pre-blocked (e.g. non-storage or mightBeBuiltIn path), do full block now
-                    if (preBlockRecord == null)
-                        BlockDevice(device);
-                    historyManager.LogEvent(device, DeviceEventType.Blocked,
-                        preBlockRecord != null
-                            ? "User confirmed block of pre-blocked storage device"
-                            : "User manually blocked device");
-                    form.DialogResult = DialogResult.No;
-                    form.Close();
-                };
+            var decision = intelligentUsbBlocker.EvaluateAndDecide(device, evaluationResult);
 
-                btnAllowAlways.Click += (s, e) =>
+            if (decision.ShouldBlockImmediately ||
+                decision.UserDecision?.Action == DeviceDecisionAction.Block)
+            {
+                if (preBlockRecord == null)
+                    BlockDevice(device);
+                historyManager.LogEvent(device, DeviceEventType.Blocked,
+                    preBlockRecord != null
+                        ? "User confirmed block of pre-blocked storage device"
+                        : "User blocked unknown device");
+                return;
+            }
+
+            if (decision.UserDecision?.Action == DeviceDecisionAction.Ignore)
+            {
+                historyManager.LogEvent(device, DeviceEventType.Insertion, "User ignored unknown-device prompt");
+                ShowBalloonTip("USB Device Ignored", "No trust decision was saved.");
+                return;
+            }
+
+            if (decision.UserDecision?.Action == DeviceDecisionAction.AllowOnce ||
+                decision.UserDecision?.Action == DeviceDecisionAction.AllowAndWhitelist)
+            {
+                if (preBlockRecord != null)
                 {
-                    // If the device was immediately blocked, reverse the block before allowing it
-                    if (preBlockRecord != null)
+                    try { unblockManager.UnblockDevice(preBlockRecord); }
+                    catch (Exception ex)
                     {
-                        try { unblockManager.UnblockDevice(preBlockRecord); }
-                        catch (Exception ex)
-                        {
-                            Debug.WriteLine(
-                                $"[HandleUnknownDevice] Pre-block reversal failed: {ex.Message}");
-                        }
+                        Debug.WriteLine($"[HandleUnknownDevice] Pre-block reversal failed: {ex.Message}");
                     }
+                }
+
+                bool addWhitelist =
+                    decision.UserDecision.Action == DeviceDecisionAction.AllowAndWhitelist ||
+                    decision.UserDecision.NeverAskAgain;
+
+                if (addWhitelist)
+                {
                     guardianCore.ApproveWhitelist(device);
                     whitelist.Add(device);
                     SaveWhitelist();
-                    historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User chose Allow & Add to Whitelist");
-                    ShowBalloonTip("Device Whitelisted",
-                        $"{device.Description} has been added to the whitelist.");
-                    if (UsbStorageBlocker.IsUsbStorageDevice(device))
-                        guardianCore.TemporarilyEnableUsbStorage(device, 60);
-                    form.DialogResult = DialogResult.Yes;
-                    form.Close();
-                };
+                    historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User approved unknown device and saved trust decision");
+                    ShowBalloonTip("Device Whitelisted", $"{device.Description} has been added to trusted devices.");
+                }
+                else
+                {
+                    historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User allowed unknown device once");
+                }
 
-                var controls = new List<Control> { lblTitle, txtDetails, btnAllow, btnBlock, btnAllowAlways, chkRemember };
-                if (lblWarning != null)
-                    controls.Add(lblWarning);
-
-                form.Controls.AddRange(controls.ToArray());
-
-                form.ShowDialog();
+                if (UsbStorageBlocker.IsUsbStorageDevice(device))
+                    guardianCore.TemporarilyEnableUsbStorage(device, 60);
             }
         }
 
