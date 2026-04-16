@@ -53,14 +53,14 @@ namespace USBGuardian
                 result.IsThreat = true;
                 result.ShouldIsolate = true;
                 result.ThreatLevel = ThreatLevel.Critical;
-                result.Reason = $">100 KPS detected ({behavior.KeysPerSecond:F1})";
+                result.Reason = $">100 keys per second detected ({behavior.KeysPerSecond:F1})";
             }
             else if (behavior.KeysPerSecond >= 20 && behavior.TimingVariancePercent < 10)
             {
                 result.IsThreat = true;
                 result.ShouldIsolate = true;
                 result.ThreatLevel = ThreatLevel.High;
-                result.Reason = $"Uniform high-speed input ({behavior.KeysPerSecond:F1} KPS, variance {behavior.TimingVariancePercent:F1}%)";
+                result.Reason = $"Uniform high-speed input ({behavior.KeysPerSecond:F1} keys per second, variance {behavior.TimingVariancePercent:F1}%)";
             }
             else if (pattern.IsThreat)
             {

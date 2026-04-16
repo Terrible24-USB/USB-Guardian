@@ -72,7 +72,7 @@ namespace USBGuardian
                 {
                     ShouldBlock = true,
                     ThreatLevel = ThreatLevel.High,
-                    Reason = "Default-deny policy: new HID device is not whitelisted"
+                    Reason = "Default-deny policy: HID device is not whitelisted"
                 };
             }
 
