@@ -18,6 +18,8 @@ namespace USBGuardian
         public bool IsRobot { get; set; }
         public double KeysPerSecond { get; set; }
         public double TimingVariancePercent { get; set; }
+        public bool ShouldBlockImmediately { get; set; }
+        public string BlockReason { get; set; } = string.Empty;
         public List<string> SuspiciousCommandsDetected { get; set; } = new();
         public int RiskScore { get; set; }
     }
@@ -26,7 +28,10 @@ namespace USBGuardian
     {
         private readonly SecurityEventLogger _logger;
         private readonly Dictionary<string, KeystrokeSession> _sessions = new();
+        private readonly Dictionary<string, string> _immediateBlockReasons = new();
         private readonly object _lock = new();
+        private const double InstantBlockThresholdKps = 100.0;
+        private const int RealtimeWindowMilliseconds = 1000;
 
         private static readonly List<string> SuspiciousPatterns = new()
         {
@@ -55,6 +60,23 @@ namespace USBGuardian
             {
                 if (!_sessions.TryGetValue(vidPid, out var session)) return;
                 session.KeystrokeTimestamps.Add(timestamp);
+
+                DateTime windowStart = timestamp.AddMilliseconds(-RealtimeWindowMilliseconds);
+                int recentCount = 0;
+                for (int i = session.KeystrokeTimestamps.Count - 1; i >= 0; i--)
+                {
+                    if (session.KeystrokeTimestamps[i] < windowStart)
+                        break;
+                    recentCount++;
+                }
+
+                double kps = recentCount / (RealtimeWindowMilliseconds / 1000.0);
+                if (kps > InstantBlockThresholdKps)
+                {
+                    string reason = $"Instant block: impossible keystroke velocity detected ({kps:F1} KPS > {InstantBlockThresholdKps:F0})";
+                    _immediateBlockReasons[vidPid] = reason;
+                    _logger.LogAttack(3, "InstantKeystrokeBlock", reason, vidPid);
+                }
             }
         }
 
@@ -72,6 +94,7 @@ namespace USBGuardian
                     {
                         session.SuspiciousCommands.Add(pattern);
                         _logger.LogAttack(3, "SuspiciousCommand", $"Suspicious command pattern '{pattern}' detected from {vidPid}", vidPid);
+                        _immediateBlockReasons[vidPid] = $"Instant block: suspicious command sequence '{pattern}' detected";
                     }
                 }
             }
@@ -91,6 +114,11 @@ namespace USBGuardian
             try
             {
                 result.SuspiciousCommandsDetected = new List<string>(session.SuspiciousCommands);
+                if (_immediateBlockReasons.TryGetValue(vidPid, out string? reason))
+                {
+                    result.ShouldBlockImmediately = true;
+                    result.BlockReason = reason;
+                }
 
                 var timestamps = session.KeystrokeTimestamps;
                 if (timestamps.Count < 2)
@@ -143,9 +171,18 @@ namespace USBGuardian
             lock (_lock)
             {
                 _sessions.Remove(vidPid);
+                _immediateBlockReasons.Remove(vidPid);
                 _logger.LogInfo(3, "BehaviorMonitor", $"Stopped keystroke monitoring for {vidPid}", vidPid);
             }
             return result;
+        }
+
+        public bool TryGetImmediateBlockReason(string vidPid, out string reason)
+        {
+            lock (_lock)
+            {
+                return _immediateBlockReasons.TryGetValue(vidPid, out reason!);
+            }
         }
     }
 }

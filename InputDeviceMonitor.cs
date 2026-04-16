@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Management;
+using System.Linq;
 using Microsoft.Win32;
 
 namespace USBGuardian
@@ -23,6 +24,21 @@ namespace USBGuardian
 
         // WMI device classes that represent input devices
         private static readonly string[] InputDeviceClasses = { "Keyboard", "Mouse" };
+        private readonly object _lock = new();
+        private readonly Dictionary<string, List<DateTime>> _keystrokeSamples = new();
+        private readonly Dictionary<string, DateTime> _recentlyDisconnectedHid = new();
+        private readonly SecurityEventLogger? _logger;
+        private ManagementEventWatcher? _creationWatcher;
+        private ManagementEventWatcher? _deletionWatcher;
+
+        public class InputMonitorResult
+        {
+            public bool ShouldBlock { get; set; }
+            public string Reason { get; set; } = string.Empty;
+            public double KeysPerSecond { get; set; }
+            public bool UniformTimingDetected { get; set; }
+            public bool RecentlyDisconnectedPortReused { get; set; }
+        }
 
         /// <summary>
         /// Represents a detected input device that appears to be blocked.
@@ -32,6 +48,11 @@ namespace USBGuardian
             public string Description { get; set; } = string.Empty;
             public string DeviceClass  { get; set; } = string.Empty;
             public string PnpDeviceId  { get; set; } = string.Empty;
+        }
+
+        public InputDeviceMonitor(SecurityEventLogger? logger = null)
+        {
+            _logger = logger;
         }
 
         /// <summary>
@@ -66,6 +87,121 @@ namespace USBGuardian
             }
 
             return blocked;
+        }
+
+        public InputMonitorResult RecordKeystrokeSample(string vidPid, DateTime timestamp)
+        {
+            var result = new InputMonitorResult();
+            try
+            {
+                lock (_lock)
+                {
+                    if (!_keystrokeSamples.TryGetValue(vidPid, out var samples))
+                    {
+                        samples = new List<DateTime>();
+                        _keystrokeSamples[vidPid] = samples;
+                    }
+
+                    samples.Add(timestamp);
+                    DateTime windowStart = timestamp.AddSeconds(-1);
+                    samples.RemoveAll(t => t < windowStart);
+
+                    result.KeysPerSecond = samples.Count;
+                    if (result.KeysPerSecond > 100)
+                    {
+                        result.ShouldBlock = true;
+                        result.Reason = $"Impossible input rate ({result.KeysPerSecond:F0} KPS)";
+                    }
+
+                    if (samples.Count >= 8)
+                    {
+                        var intervals = new List<double>(samples.Count - 1);
+                        for (int i = 1; i < samples.Count; i++)
+                            intervals.Add((samples[i] - samples[i - 1]).TotalMilliseconds);
+
+                        if (intervals.Count > 0)
+                        {
+                            double mean = intervals.Average();
+                            if (mean > 0)
+                            {
+                                double variance = intervals.Select(i => Math.Pow(i - mean, 2)).Average();
+                                double stdDev = Math.Sqrt(variance);
+                                double coeffVar = stdDev / mean;
+                                result.UniformTimingDetected = coeffVar < 0.08;
+                                if (result.UniformTimingDetected && mean < 40.0)
+                                {
+                                    result.ShouldBlock = true;
+                                    result.Reason = "Uniform machine-like keystroke timing detected";
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[InputDeviceMonitor] RecordKeystrokeSample failed: {ex.Message}");
+            }
+
+            if (result.ShouldBlock)
+                _logger?.LogAttack(5, "RealtimeInputBlock", $"{vidPid}: {result.Reason}", vidPid);
+
+            return result;
+        }
+
+        public void StartRealtimeHidMonitoring()
+        {
+            try
+            {
+                if (_creationWatcher != null || _deletionWatcher != null)
+                    return;
+
+                _creationWatcher = new ManagementEventWatcher(
+                    new WqlEventQuery("SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_PnPEntity'"));
+                _creationWatcher.EventArrived += (_, e) => HandleRealtimePnpEvent(e, isCreation: true);
+                _creationWatcher.Start();
+
+                _deletionWatcher = new ManagementEventWatcher(
+                    new WqlEventQuery("SELECT * FROM __InstanceDeletionEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_PnPEntity'"));
+                _deletionWatcher.EventArrived += (_, e) => HandleRealtimePnpEvent(e, isCreation: false);
+                _deletionWatcher.Start();
+
+                _logger?.LogInfo(5, "InputMonitor", "Real-time HID WMI monitoring started");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[InputDeviceMonitor] StartRealtimeHidMonitoring failed: {ex.Message}");
+            }
+        }
+
+        public void StopRealtimeHidMonitoring()
+        {
+            try
+            {
+                _creationWatcher?.Stop();
+                _creationWatcher?.Dispose();
+                _creationWatcher = null;
+
+                _deletionWatcher?.Stop();
+                _deletionWatcher?.Dispose();
+                _deletionWatcher = null;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[InputDeviceMonitor] StopRealtimeHidMonitoring failed: {ex.Message}");
+            }
+        }
+
+        public bool WasRecentlyDisconnected(string pnpDeviceId)
+        {
+            lock (_lock)
+            {
+                if (_recentlyDisconnectedHid.TryGetValue(pnpDeviceId, out DateTime disconnectedAt))
+                {
+                    return (DateTime.UtcNow - disconnectedAt) <= TimeSpan.FromMinutes(10);
+                }
+                return false;
+            }
         }
 
         // ---- Private helpers ----
@@ -158,6 +294,48 @@ namespace USBGuardian
                     return true;
             }
             return false;
+        }
+
+        private void HandleRealtimePnpEvent(EventArrivedEventArgs e, bool isCreation)
+        {
+            try
+            {
+                if (e.NewEvent?["TargetInstance"] is not ManagementBaseObject target)
+                    return;
+
+                string pnpClass = target["PNPClass"]?.ToString() ?? string.Empty;
+                if (!InputDeviceClasses.Contains(pnpClass, StringComparer.OrdinalIgnoreCase))
+                    return;
+
+                string deviceId = target["DeviceID"]?.ToString() ?? string.Empty;
+                if (string.IsNullOrEmpty(deviceId))
+                    return;
+
+                if (isCreation)
+                {
+                    bool reused = WasRecentlyDisconnected(deviceId);
+                    string evt = reused ? "HidPortReuse" : "HidConnected";
+                    string details = reused
+                        ? $"Potential HID emulation on recently disconnected port: {deviceId}"
+                        : $"HID device connected: {deviceId}";
+                    if (reused)
+                        _logger?.LogWarning(5, evt, details, deviceId);
+                    else
+                        _logger?.LogInfo(5, evt, details, deviceId);
+                }
+                else
+                {
+                    lock (_lock)
+                    {
+                        _recentlyDisconnectedHid[deviceId] = DateTime.UtcNow;
+                    }
+                    _logger?.LogInfo(5, "HidDisconnected", $"HID device disconnected: {deviceId}", deviceId);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[InputDeviceMonitor] HandleRealtimePnpEvent failed: {ex.Message}");
+            }
         }
     }
 }

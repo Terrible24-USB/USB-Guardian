@@ -9,6 +9,28 @@ namespace USBGuardian
     /// </summary>
     public static class HIDClassifier
     {
+        public enum HIDDeviceType
+        {
+            NonHid,
+            Keyboard,
+            Mouse,
+            Gamepad,
+            Composite,
+            Unknown
+        }
+
+        public class HIDThreatAssessment
+        {
+            public bool IsHidDevice { get; set; }
+            public HIDDeviceType DeviceType { get; set; } = HIDDeviceType.Unknown;
+            public bool IsCompositeDevice { get; set; }
+            public bool HasStorageAndHidCombination { get; set; }
+            public bool IsLikelyRubberDucky { get; set; }
+            public ThreatLevel ThreatLevel { get; set; } = ThreatLevel.None;
+            public int RiskScore { get; set; }
+            public List<string> Findings { get; set; } = new();
+        }
+
         // USB Interface Class codes
         public const byte CLASS_AUDIO = 0x01;
         public const byte CLASS_CDC = 0x02;
@@ -55,6 +77,97 @@ namespace USBGuardian
             public byte InterfaceClass { get; set; }
             public byte InterfaceSubClass { get; set; }
             public byte InterfaceProtocol { get; set; }
+        }
+
+        public static HIDThreatAssessment AssessDevice(DeviceFingerprint fingerprint, BehaviorAnalysisResult? behaviorResult = null)
+        {
+            var assessment = new HIDThreatAssessment();
+
+            var interfaces = (fingerprint.AllInterfaces != null && fingerprint.AllInterfaces.Count > 0)
+                ? fingerprint.AllInterfaces
+                : new List<InterfaceInfo>
+                {
+                    new InterfaceInfo
+                    {
+                        InterfaceClass = fingerprint.InterfaceClass,
+                        InterfaceSubClass = fingerprint.InterfaceSubClass,
+                        InterfaceProtocol = fingerprint.InterfaceProtocol
+                    }
+                };
+
+            bool hasHid = interfaces.Any(i => i.InterfaceClass == CLASS_HID) || fingerprint.UsbDeviceClass == CLASS_HID;
+            bool hasStorage = interfaces.Any(i => i.InterfaceClass == CLASS_MASS_STORAGE) || fingerprint.UsbDeviceClass == CLASS_MASS_STORAGE;
+            bool hasKeyboard = interfaces.Any(i => i.InterfaceClass == CLASS_HID &&
+                                                  (i.InterfaceProtocol == HID_PROTO_KEYBOARD ||
+                                                   (i.InterfaceSubClass == 0x01 && i.InterfaceProtocol == HID_PROTO_KEYBOARD)));
+            bool hasMouse = interfaces.Any(i => i.InterfaceClass == CLASS_HID &&
+                                                (i.InterfaceProtocol == HID_PROTO_MOUSE ||
+                                                 (i.InterfaceSubClass == 0x01 && i.InterfaceProtocol == HID_PROTO_MOUSE)));
+            bool hasGenericHid = interfaces.Any(i => i.InterfaceClass == CLASS_HID && i.InterfaceProtocol == HID_PROTO_NONE);
+
+            assessment.IsHidDevice = hasHid;
+            assessment.IsCompositeDevice = interfaces.Select(i => i.InterfaceClass).Distinct().Count() > 1;
+            assessment.HasStorageAndHidCombination = hasStorage && hasHid;
+
+            if (!hasHid)
+                assessment.DeviceType = HIDDeviceType.NonHid;
+            else if (hasKeyboard && hasMouse)
+                assessment.DeviceType = HIDDeviceType.Composite;
+            else if (hasKeyboard)
+                assessment.DeviceType = HIDDeviceType.Keyboard;
+            else if (hasMouse)
+                assessment.DeviceType = HIDDeviceType.Mouse;
+            else if (hasGenericHid)
+                assessment.DeviceType = HIDDeviceType.Gamepad;
+            else
+                assessment.DeviceType = HIDDeviceType.Unknown;
+
+            int risk = 0;
+
+            if (assessment.HasStorageAndHidCombination)
+            {
+                assessment.Findings.Add("Critical: HID + Mass Storage composite behavior detected.");
+                risk += 60;
+                assessment.ThreatLevel = ThreatLevel.Critical;
+            }
+
+            if (assessment.IsCompositeDevice && hasKeyboard)
+            {
+                assessment.Findings.Add("Composite keyboard-like HID detected.");
+                risk += 20;
+                if (assessment.ThreatLevel < ThreatLevel.High)
+                    assessment.ThreatLevel = ThreatLevel.High;
+            }
+
+            if (behaviorResult != null)
+            {
+                if (behaviorResult.ShouldBlockImmediately)
+                {
+                    assessment.Findings.Add(behaviorResult.BlockReason);
+                    risk += 40;
+                    assessment.ThreatLevel = ThreatLevel.Critical;
+                }
+                else if (behaviorResult.IsRobot || behaviorResult.RiskScore >= 70)
+                {
+                    assessment.Findings.Add("Non-human keystroke behavior detected.");
+                    risk += 30;
+                    if (assessment.ThreatLevel < ThreatLevel.High)
+                        assessment.ThreatLevel = ThreatLevel.High;
+                }
+            }
+
+            if (assessment.ThreatLevel == ThreatLevel.None && hasHid)
+            {
+                assessment.ThreatLevel = ThreatLevel.Medium;
+                assessment.Findings.Add("HID device requires active input monitoring.");
+            }
+
+            assessment.RiskScore = Math.Min(100, risk);
+            assessment.IsLikelyRubberDucky = assessment.ThreatLevel >= ThreatLevel.High &&
+                                             (assessment.HasStorageAndHidCombination ||
+                                              (behaviorResult?.ShouldBlockImmediately ?? false));
+
+            return assessment;
         }
 
         /// <summary>
