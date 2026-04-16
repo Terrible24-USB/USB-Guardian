@@ -122,7 +122,7 @@ namespace USBGuardian
             historyManager = new DeviceHistoryManager();
             deviceIdentifier.HistoryManager = historyManager;
 
-            // Initialize the 6-layer defense core
+            // Initialize the redesigned security engine core
             guardianCore = new UsbGuardianCore();
             _ = guardianCore.InitializeAsync();
 
@@ -410,10 +410,10 @@ namespace USBGuardian
                 DeviceHistoryRecord history = historyManager.LogEvent(currentDevice, DeviceEventType.Insertion);
 
                 // =============================================
-                // 6-LAYER SECURITY EVALUATION
+                // REDESIGNED SECURITY ENGINE EVALUATION
                 // =============================================
                 DeviceEvaluationResult evalResult = guardianCore.EvaluateDevice(currentDevice);
-                Debug.WriteLine($"[6-Layer] Threat={evalResult.OverallThreatLevel}, ShouldBlock={evalResult.ShouldBlock}");
+                Debug.WriteLine($"[GuardianEngine] Threat={evalResult.OverallThreatLevel}, ShouldBlock={evalResult.ShouldBlock}");
 
                 if (evalResult.ShouldBlock)
                 {
