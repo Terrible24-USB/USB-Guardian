@@ -94,7 +94,8 @@ namespace USBGuardian
                     {
                         session.SuspiciousCommands.Add(pattern);
                         _logger.LogAttack(3, "SuspiciousCommand", $"Suspicious command pattern '{pattern}' detected from {vidPid}", vidPid);
-                        _immediateBlockReasons[vidPid] = $"Instant block: suspicious command sequence '{pattern}' detected";
+                        if (!_immediateBlockReasons.ContainsKey(vidPid))
+                            _immediateBlockReasons[vidPid] = $"Instant block: suspicious command sequence '{pattern}' detected";
                     }
                 }
             }

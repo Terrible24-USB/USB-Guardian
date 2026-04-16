@@ -21,6 +21,8 @@ namespace USBGuardian
         private readonly UsbBlockingManager _blockingManager;
         private readonly object _lock = new();
         private readonly IncidentResponseSnapshot _snapshot = new();
+        private const int MaxForensicRecords = 500;
+        private const int ServiceStartDisabled = 4;
 
         public IncidentResponseManager(SecurityEventLogger logger, UsbBlockingManager blockingManager)
         {
@@ -87,7 +89,7 @@ namespace USBGuardian
                 const string usbStorPath = @"SYSTEM\CurrentControlSet\Services\USBSTOR";
                 using var key = Registry.LocalMachine.OpenSubKey(usbStorPath, writable: true);
                 if (key == null) return;
-                key.SetValue("Start", 4, RegistryValueKind.DWord);
+                key.SetValue("Start", ServiceStartDisabled, RegistryValueKind.DWord);
 
                 lock (_lock)
                 {
@@ -106,9 +108,9 @@ namespace USBGuardian
             try
             {
                 // Best-effort: disable USBSTOR and USB hub stack startup to reduce further exposure.
-                SetServiceStart("USBSTOR", 4);
-                SetServiceStart("usbhub", 4);
-                SetServiceStart("USBHUB3", 4);
+                SetServiceStart("USBSTOR", ServiceStartDisabled);
+                SetServiceStart("usbhub", ServiceStartDisabled);
+                SetServiceStart("USBHUB3", ServiceStartDisabled);
 
                 lock (_lock)
                 {
@@ -147,7 +149,8 @@ namespace USBGuardian
             {
                 _snapshot.LastIncidentUtc = DateTime.UtcNow;
                 _snapshot.ForensicRecords.Add(record);
-                if (_snapshot.ForensicRecords.Count > 500)
+                // Keep bounded in-memory forensic history to avoid unbounded growth in long-running tray sessions.
+                if (_snapshot.ForensicRecords.Count > MaxForensicRecords)
                     _snapshot.ForensicRecords.RemoveAt(0);
             }
         }
@@ -168,6 +171,9 @@ namespace USBGuardian
             catch (Exception ex)
             {
                 Debug.WriteLine($"[IncidentResponseManager] WriteToWindowsEventLog failed: {ex.Message}");
+                _logger.LogWarning(6, "IncidentEventLogWriteFailed",
+                    $"Could not write Windows Event Log entry (likely non-elevated context): {ex.Message}",
+                    vidPid);
             }
         }
 

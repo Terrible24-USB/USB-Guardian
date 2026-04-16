@@ -89,7 +89,10 @@ namespace USBGuardian
 
                 // Layer 3: Real-time keystroke behavior
                 _behaviorAnalyzer.StartMonitoring(vidPid);
-                if (_inputMonitor.WasRecentlyDisconnected(fingerprint.DevicePath ?? string.Empty))
+                string pnpIdentity = !string.IsNullOrWhiteSpace(fingerprint.DeviceId)
+                    ? fingerprint.DeviceId
+                    : (fingerprint.DevicePath ?? string.Empty);
+                if (_inputMonitor.WasRecentlyDisconnected(pnpIdentity))
                 {
                     result.Layer3Result = new BehaviorAnalysisResult
                     {

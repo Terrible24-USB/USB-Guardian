@@ -30,6 +30,9 @@ namespace USBGuardian
         private readonly SecurityEventLogger? _logger;
         private ManagementEventWatcher? _creationWatcher;
         private ManagementEventWatcher? _deletionWatcher;
+        private const double MachineTimingCoeffVarThreshold = 0.08;
+        private const double MachineTimingMeanIntervalMsThreshold = 40.0;
+        private static readonly TimeSpan RecentlyDisconnectedWindow = TimeSpan.FromMinutes(10);
 
         public class InputMonitorResult
         {
@@ -122,13 +125,16 @@ namespace USBGuardian
                         if (intervals.Count > 0)
                         {
                             double mean = intervals.Average();
-                            if (mean > 0)
+                            if (mean > 0 && !double.IsNaN(mean) && !double.IsInfinity(mean))
                             {
                                 double variance = intervals.Select(i => Math.Pow(i - mean, 2)).Average();
                                 double stdDev = Math.Sqrt(variance);
                                 double coeffVar = stdDev / mean;
-                                result.UniformTimingDetected = coeffVar < 0.08;
-                                if (result.UniformTimingDetected && mean < 40.0)
+                                if (double.IsNaN(coeffVar) || double.IsInfinity(coeffVar))
+                                    coeffVar = 1.0;
+                                // Very low variance + very short average interval indicates automated key injection
+                                result.UniformTimingDetected = coeffVar < MachineTimingCoeffVarThreshold;
+                                if (result.UniformTimingDetected && mean < MachineTimingMeanIntervalMsThreshold)
                                 {
                                     result.ShouldBlock = true;
                                     result.Reason = "Uniform machine-like keystroke timing detected";
@@ -198,7 +204,8 @@ namespace USBGuardian
             {
                 if (_recentlyDisconnectedHid.TryGetValue(pnpDeviceId, out DateTime disconnectedAt))
                 {
-                    return (DateTime.UtcNow - disconnectedAt) <= TimeSpan.FromMinutes(10);
+                    // 10-minute window captures rapid unplug/replug port hijacking behavior without long-lived state growth
+                    return (DateTime.UtcNow - disconnectedAt) <= RecentlyDisconnectedWindow;
                 }
                 return false;
             }

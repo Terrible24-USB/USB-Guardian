@@ -30,6 +30,10 @@ namespace USBGuardian
             public int RiskScore { get; set; }
             public List<string> Findings { get; set; } = new();
         }
+        private const int RiskStoragePlusHid = 60;
+        private const int RiskCompositeKeyboard = 20;
+        private const int RiskImmediateBlockSignal = 40;
+        private const int RiskRobotBehavior = 30;
 
         // USB Interface Class codes
         public const byte CLASS_AUDIO = 0x01;
@@ -98,11 +102,9 @@ namespace USBGuardian
             bool hasHid = interfaces.Any(i => i.InterfaceClass == CLASS_HID) || fingerprint.UsbDeviceClass == CLASS_HID;
             bool hasStorage = interfaces.Any(i => i.InterfaceClass == CLASS_MASS_STORAGE) || fingerprint.UsbDeviceClass == CLASS_MASS_STORAGE;
             bool hasKeyboard = interfaces.Any(i => i.InterfaceClass == CLASS_HID &&
-                                                  (i.InterfaceProtocol == HID_PROTO_KEYBOARD ||
-                                                   (i.InterfaceSubClass == 0x01 && i.InterfaceProtocol == HID_PROTO_KEYBOARD)));
+                                                   i.InterfaceProtocol == HID_PROTO_KEYBOARD);
             bool hasMouse = interfaces.Any(i => i.InterfaceClass == CLASS_HID &&
-                                                (i.InterfaceProtocol == HID_PROTO_MOUSE ||
-                                                 (i.InterfaceSubClass == 0x01 && i.InterfaceProtocol == HID_PROTO_MOUSE)));
+                                                i.InterfaceProtocol == HID_PROTO_MOUSE);
             bool hasGenericHid = interfaces.Any(i => i.InterfaceClass == CLASS_HID && i.InterfaceProtocol == HID_PROTO_NONE);
 
             assessment.IsHidDevice = hasHid;
@@ -127,14 +129,16 @@ namespace USBGuardian
             if (assessment.HasStorageAndHidCombination)
             {
                 assessment.Findings.Add("Critical: HID + Mass Storage composite behavior detected.");
-                risk += 60;
+                // HID + storage is a canonical Rubber Ducky/BadUSB pattern, so it carries most of the risk weight
+                risk += RiskStoragePlusHid;
                 assessment.ThreatLevel = ThreatLevel.Critical;
             }
 
             if (assessment.IsCompositeDevice && hasKeyboard)
             {
                 assessment.Findings.Add("Composite keyboard-like HID detected.");
-                risk += 20;
+                // Composite keyboard interfaces are suspicious, but below explicit HID+storage combinations
+                risk += RiskCompositeKeyboard;
                 if (assessment.ThreatLevel < ThreatLevel.High)
                     assessment.ThreatLevel = ThreatLevel.High;
             }
@@ -144,13 +148,15 @@ namespace USBGuardian
                 if (behaviorResult.ShouldBlockImmediately)
                 {
                     assessment.Findings.Add(behaviorResult.BlockReason);
-                    risk += 40;
+                    // Layer 3 immediate-block signal means active command-injection behavior is already detected
+                    risk += RiskImmediateBlockSignal;
                     assessment.ThreatLevel = ThreatLevel.Critical;
                 }
                 else if (behaviorResult.IsRobot || behaviorResult.RiskScore >= 70)
                 {
                     assessment.Findings.Add("Non-human keystroke behavior detected.");
-                    risk += 30;
+                    // Robot-like timing strongly suggests automation but can be less definitive than instant block signals
+                    risk += RiskRobotBehavior;
                     if (assessment.ThreatLevel < ThreatLevel.High)
                         assessment.ThreatLevel = ThreatLevel.High;
                 }
