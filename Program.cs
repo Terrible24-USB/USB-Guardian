@@ -20,6 +20,8 @@ namespace USBGuardian
         [STAThread]
         static void Main()
         {
+            ProgramBase.EnsureStartupSecurity();
+
             // Create console window
             AllocConsole();
 
@@ -241,6 +243,7 @@ namespace USBGuardian
         {
             try
             {
+                if (BootRecoveryManager.IsPreBootLockPresent()) return;
                 if (!unblockManager.IsLegacyUsbStorBlock()) return;
 
                 guardianCore.EventLogger.LogCritical(0, "StartupWarning",
@@ -473,6 +476,8 @@ namespace USBGuardian
                     Debug.WriteLine("✅ DEVICE ALLOWED - Found in whitelist");
                     matchedDevice.LastConnectedTime = DateTime.UtcNow;
                     SaveWhitelist();
+                    if (UsbStorageBlocker.IsUsbStorageDevice(currentDevice))
+                        guardianCore.TemporarilyEnableUsbStorage(currentDevice, 60);
 
                     historyManager.LogEvent(currentDevice, DeviceEventType.Whitelisted, "Matched existing whitelist entry");
 
@@ -482,6 +487,17 @@ namespace USBGuardian
                 }
                 else
                 {
+                    if (guardianCore.IsWhitelisted(currentDevice))
+                    {
+                        if (UsbStorageBlocker.IsUsbStorageDevice(currentDevice))
+                            guardianCore.TemporarilyEnableUsbStorage(currentDevice, 60);
+                        historyManager.LogEvent(currentDevice, DeviceEventType.Whitelisted, "Matched security-engine VID:PID whitelist entry");
+                        ShowBalloonTip(
+                            "USB Device Allowed",
+                            $"{currentDevice.Description ?? "Unknown Device"} has been allowed by security whitelist.");
+                        return;
+                    }
+
                     Debug.WriteLine("❌ DEVICE NOT IN WHITELIST");
                     HandleUnknownDevice(currentDevice);
                 }
@@ -620,12 +636,16 @@ namespace USBGuardian
                     }
                     if (chkRemember.Checked)
                     {
+                        guardianCore.ApproveWhitelist(device);
                         whitelist.Add(device);
                         SaveWhitelist();
                         historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User chose Allow & Remember");
                         ShowBalloonTip("Device Whitelisted",
                             $"{device.Description} has been added to the whitelist.");
                     }
+
+                    if (UsbStorageBlocker.IsUsbStorageDevice(device))
+                        guardianCore.TemporarilyEnableUsbStorage(device, 60);
                     form.DialogResult = DialogResult.OK;
                     form.Close();
                 };
@@ -655,11 +675,14 @@ namespace USBGuardian
                                 $"[HandleUnknownDevice] Pre-block reversal failed: {ex.Message}");
                         }
                     }
+                    guardianCore.ApproveWhitelist(device);
                     whitelist.Add(device);
                     SaveWhitelist();
                     historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User chose Allow & Add to Whitelist");
                     ShowBalloonTip("Device Whitelisted",
                         $"{device.Description} has been added to the whitelist.");
+                    if (UsbStorageBlocker.IsUsbStorageDevice(device))
+                        guardianCore.TemporarilyEnableUsbStorage(device, 60);
                     form.DialogResult = DialogResult.Yes;
                     form.Close();
                 };
@@ -1427,6 +1450,7 @@ namespace USBGuardian
         {
             try
             {
+                if (BootRecoveryManager.IsPreBootLockPresent()) return;
                 using var svcKey = Registry.LocalMachine.OpenSubKey(
                     @"SYSTEM\CurrentControlSet\Services\usbstor");
                 if (svcKey == null) return;

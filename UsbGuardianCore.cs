@@ -118,5 +118,43 @@ namespace USBGuardian
             return status;
         }
 
+        public bool IsWhitelisted(DeviceFingerprint fingerprint)
+        {
+            try
+            {
+                return _securityEngine.IsWhitelisted(fingerprint);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[UsbGuardianCore] IsWhitelisted failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        public void ApproveWhitelist(DeviceFingerprint fingerprint)
+        {
+            try
+            {
+                _securityEngine.ApproveWhitelisted(fingerprint);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[UsbGuardianCore] ApproveWhitelist failed: {ex.Message}");
+            }
+        }
+
+        public bool TemporarilyEnableUsbStorage(DeviceFingerprint fingerprint, int enableDurationSeconds = 60)
+        {
+            try
+            {
+                return _securityEngine.TemporarilyEnableUsbStorage(fingerprint, enableDurationSeconds);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[UsbGuardianCore] TemporarilyEnableUsbStorage failed: {ex.Message}");
+                return false;
+            }
+        }
+
     }
 }

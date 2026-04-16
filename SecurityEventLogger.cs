@@ -68,6 +68,18 @@ namespace USBGuardian
         public void LogAttack(int layer, string eventType, string details, string? vidPid = null) =>
             LogEvent(new SecurityEvent { Severity = SecuritySeverity.Attack, Layer = layer, EventType = eventType, Details = details, DeviceVidPid = vidPid });
 
+        public void LogPreBootAction(string action, string details, SecuritySeverity severity = SecuritySeverity.Info, string? vidPid = null)
+        {
+            LogEvent(new SecurityEvent
+            {
+                Severity = severity,
+                Layer = 0,
+                EventType = $"PreBoot.{action}",
+                Details = details,
+                DeviceVidPid = vidPid
+            });
+        }
+
         public void LogWindowsEvent(SecuritySeverity severity, string source, string message)
         {
             try
