@@ -25,15 +25,22 @@ namespace USBGuardian
         private readonly SecurityEventLogger _eventLogger;
         private readonly UsbBlockingManager _blockingManager;
         private readonly UsbGuardianSecurityEngine _securityEngine;
+        private readonly DeviceInformationCollector _deviceInformationCollector;
+        private readonly DeviceWhitelist _deviceWhitelist;
+        private readonly IntelligentUsbBlocker _intelligentUsbBlocker;
 
         public SecurityEventLogger EventLogger => _eventLogger;
         public UsbBlockingManager BlockingManager => _blockingManager;
+        public IntelligentUsbBlocker IntelligentUsbBlocker => _intelligentUsbBlocker;
 
         public UsbGuardianCore()
         {
             _eventLogger = new SecurityEventLogger();
             _blockingManager = new UsbBlockingManager(_eventLogger);
             _securityEngine = new UsbGuardianSecurityEngine(_eventLogger, _blockingManager);
+            _deviceInformationCollector = new DeviceInformationCollector();
+            _deviceWhitelist = new DeviceWhitelist();
+            _intelligentUsbBlocker = new IntelligentUsbBlocker(_eventLogger, _deviceWhitelist, _deviceInformationCollector);
         }
 
         public async Task InitializeAsync()

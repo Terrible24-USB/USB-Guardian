@@ -103,26 +103,7 @@ namespace USBGuardian
                     result.Message = $"Registry key not found: {subKeyPath}";
                 }
 
-                // Also try disabling the service — but record the previous Start value
-                if (!string.IsNullOrEmpty(device.Service))
-                {
-                    string svcPath = $@"SYSTEM\CurrentControlSet\Services\{device.Service}";
-                    using var svcKey = Registry.LocalMachine.OpenSubKey(svcPath, writable: true);
-                    if (svcKey != null)
-                    {
-                        int previousStart = svcKey.GetValue("Start") is int sv ? sv : 3;
-                        svcKey.SetValue("Start", 4, RegistryValueKind.DWord); // 4 = Disabled
-                        result.Message += $"; Disabled service {device.Service}";
-
-                        actionLog?.Add(new BlockActionRecord
-                        {
-                            ActionType = "ServiceStart",
-                            RegistryPath = svcPath,
-                            ServiceName = device.Service,
-                            PreviousServiceStart = previousStart
-                        });
-                    }
-                }
+                result.Message += "; Per-device block applied (global USBSTOR service unchanged)";
 
                 _logger.LogCritical(0, "DeviceBlocked", $"Registry block: {device.Vid}:{device.Pid} — {result.Message}", $"{device.Vid}:{device.Pid}");
             }

@@ -41,8 +41,8 @@ namespace USBGuardian
 
         public static void DisableUsbStorageSurface(SecurityEventLogger? logger = null)
         {
-            SetServiceStart("usbstor", 4, logger);
-            SetServiceStart("ShellHWDetection", 4, logger);
+            logger?.LogPreBootAction("ServiceHardening",
+                "USBSTOR global service state left unchanged; using per-device blocking only.");
             DisableAutoRunPolicies(logger);
         }
 

@@ -35,6 +35,7 @@ namespace USBGuardian
         private static extern int CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
 
         private readonly SecurityEventLogger _logger;
+        private readonly DeviceInformationCollector _deviceInformationCollector;
 
         /// <summary>
         /// Optional persistent store for blocked-device records.
@@ -43,9 +44,10 @@ namespace USBGuardian
         /// </summary>
         public BlockedDeviceStore? Store { get; set; }
 
-        public UsbStorageBlocker(SecurityEventLogger logger)
+        public UsbStorageBlocker(SecurityEventLogger logger, DeviceInformationCollector? deviceInformationCollector = null)
         {
             _logger = logger;
+            _deviceInformationCollector = deviceInformationCollector ?? new DeviceInformationCollector();
         }
 
         /// <summary>
@@ -85,10 +87,16 @@ namespace USBGuardian
             string vidPid = $"{device.Vid}:{device.Pid}";
             bool anySuccess = false;
             var actions = new List<BlockActionRecord>();
+            var deviceInfo = _deviceInformationCollector.Collect(device);
 
             try
             {
                 _logger.LogAttack(0, "StorageBlock", $"Blocking USB storage device {vidPid}", vidPid);
+                _logger.LogCritical(0, "StorageBlockInfo",
+                    $"Preparing per-device block for {deviceInfo.VidPid} " +
+                    $"(Manufacturer={deviceInfo.Manufacturer}, Product={deviceInfo.ProductName}, Serial={deviceInfo.SerialNumber ?? "N/A"}, " +
+                    $"DescriptorHash={deviceInfo.DescriptorHash}). Global USBSTOR service is not disabled.",
+                    vidPid);
 
                 // Step 1: Set registry flags FIRST to prevent re-enumeration.
                 // ConfigFlags must be written before Windows re-enumerates so that
