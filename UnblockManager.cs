@@ -513,60 +513,81 @@ namespace USBGuardian
                         results = searcher.Get();
                         foreach (ManagementObject obj in results)
                         {
-                            if (obj == null) continue;
-
-                            // devId is declared outside the try so it is accessible in catch blocks
-                            // even if the DeviceID property retrieval itself throws.
-                            string devId = "<unknown>";
                             try
                             {
-                                devId = obj["DeviceID"]?.ToString() ?? string.Empty;
+                                // Defensive check: ensure object is still valid
+                                if (obj == null)
+                                {
+                                    Debug.WriteLine("[UnblockManager] Device object became null before Enable");
+                                    continue;
+                                }
+
+                                // Try to get DeviceID one more time to validate object is alive
+                                string devId = obj["DeviceID"]?.ToString() ?? string.Empty;
+                                if (string.IsNullOrEmpty(devId))
+                                {
+                                    Debug.WriteLine("[UnblockManager] Could not retrieve DeviceID from object");
+                                    continue;
+                                }
+
                                 if (!alreadySeen.Add(devId)) continue;
 
-                                obj.InvokeMethod("Enable", null);
-                                enabled.Add(devId);
-                                Debug.WriteLine($"[UnblockManager] Enabled via WMI: {devId}");
-                            }
-                            catch (ManagementException ex) when (
-                                ex.ErrorCode == ManagementStatus.NotFound ||
-                                ex.ErrorCode == ManagementStatus.InvalidObject ||
-                                ex.ErrorCode == ManagementStatus.InvalidQuery)
-                            {
-                                // These three codes indicate the WMI object is stale or the device
-                                // is gone.  Other ManagementException codes (e.g. AccessDenied) fall
-                                // through to the general handler below.
-                                string msg = $"WMI Enable skipped for '{devId}': device no longer available " +
-                                             $"(WMI status: {ex.ErrorCode})";
-                                Debug.WriteLine($"[UnblockManager] {msg}");
-                                _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
-                                continue;
-                            }
-                            catch (NullReferenceException ex)
-                            {
-                                // The underlying WMI COM object was released or became invalid
-                                // between the query and the Enable call (e.g. device unplugged in
-                                // the interim).  Catching NullReferenceException is intentional
-                                // here: WMI COM interop can surface a null RCW that cannot be
-                                // guarded against with a simple reference null-check.
-                                string msg = $"WMI object became null for '{devId}': {ex.Message} — " +
-                                             "device may have been disconnected; skipping this node";
-                                Debug.WriteLine($"[UnblockManager] {msg}");
-                                _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
-                                continue;
+                                // Null-safety and exception handling right before the risky invoke
+                                try
+                                {
+                                    obj.InvokeMethod("Enable", null);
+                                    enabled.Add(devId);
+                                    Debug.WriteLine($"[UnblockManager] Enabled via WMI: {devId}");
+                                }
+                                catch (InvalidOperationException invalidEx)
+                                {
+                                    string msg = $"WMI Enable failed for '{devId}' (object no longer available): {invalidEx.Message}";
+                                    Debug.WriteLine($"[UnblockManager] {msg}");
+                                    _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                }
+                                catch (ManagementException mex) when (
+                                    mex.ErrorCode == ManagementStatus.NotFound ||
+                                    mex.ErrorCode == ManagementStatus.InvalidObject ||
+                                    mex.ErrorCode == ManagementStatus.InvalidQuery)
+                                {
+                                    string msg = $"WMI Enable skipped for '{devId}': device no longer available " +
+                                                 $"(WMI status: {mex.ErrorCode})";
+                                    Debug.WriteLine($"[UnblockManager] {msg}");
+                                    _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                }
+                                catch (ManagementException mex)
+                                {
+                                    string msg = $"WMI Enable failed for '{devId}' (Management error: {mex.ErrorCode}): {mex.Message}";
+                                    Debug.WriteLine($"[UnblockManager] {msg}");
+                                    _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                }
+                                catch (COMException comEx)
+                                {
+                                    string msg = $"WMI Enable failed for '{devId}' (COM error, device may be disconnected): {comEx.Message}";
+                                    Debug.WriteLine($"[UnblockManager] {msg}");
+                                    _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                }
+                                catch (NullReferenceException nre)
+                                {
+                                    string msg = $"WMI Enable failed for '{devId}' ({nre.GetType().Name}): {nre.Message} " +
+                                                 "(device may have been disconnected; skipping this node)";
+                                    Debug.WriteLine($"[UnblockManager] {msg}");
+                                    _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    string msg = $"WMI Enable failed for '{devId}' ({ex.GetType().Name}): {ex.Message} " +
+                                                 "(device may already be active or temporarily absent — this is usually harmless)";
+                                    Debug.WriteLine($"[UnblockManager] {msg}");
+                                    _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                }
+
+                                if (exact) break; // only need one result for exact-match queries
                             }
                             catch (Exception ex)
                             {
-                                // Log visibly — this is a non-fatal error (device may already be
-                                // active or temporarily unavailable).  We continue enabling other
-                                // nodes rather than aborting the entire unblock operation.
-                                string msg = $"WMI Enable failed for '{devId}': {ex.Message} " +
-                                             "(device may already be active or temporarily absent — this is usually harmless)";
-                                Debug.WriteLine($"[UnblockManager] {msg}");
-                                _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
-                                continue;
+                                Debug.WriteLine($"[UnblockManager] Error processing device in WMI enable loop ({ex.GetType().Name}): {ex.Message}");
                             }
-
-                            if (exact) break; // only need one result for exact-match queries
                         }
                     }
                     catch (Exception ex)
