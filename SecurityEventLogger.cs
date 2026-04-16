@@ -68,6 +68,26 @@ namespace USBGuardian
         public void LogAttack(int layer, string eventType, string details, string? vidPid = null) =>
             LogEvent(new SecurityEvent { Severity = SecuritySeverity.Attack, Layer = layer, EventType = eventType, Details = details, DeviceVidPid = vidPid });
 
+        public void LogWindowsEvent(SecuritySeverity severity, string source, string message)
+        {
+            try
+            {
+                var type = severity switch
+                {
+                    SecuritySeverity.Critical => EventLogEntryType.Error,
+                    SecuritySeverity.Attack => EventLogEntryType.Error,
+                    SecuritySeverity.Warning => EventLogEntryType.Warning,
+                    _ => EventLogEntryType.Information
+                };
+
+                EventLog.WriteEntry(source, message, type);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[SecurityEventLogger] Failed writing Windows Event Log: {ex.Message}");
+            }
+        }
+
         public List<SecurityEvent> GetRecentEvents(int count = 50)
         {
             lock (_lock)
