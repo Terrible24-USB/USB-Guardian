@@ -12,6 +12,7 @@ namespace USBGuardian
         public DeviceDecisionResult? UserDecision { get; set; }
         public ThreatLevel ThreatLevel { get; set; }
         public string RiskAssessment { get; set; } = string.Empty;
+        public bool ShouldPersistTrustDecision { get; set; }
     }
 
     public sealed class IntelligentUsbBlocker
@@ -76,7 +77,10 @@ namespace USBGuardian
             };
 
             DeviceDecisionResult decision = (decisionProvider ?? DeviceDecisionDialog.ShowDecision)(request);
-            if (decision.Action == DeviceDecisionAction.AllowAndWhitelist || decision.NeverAskAgain)
+            result.ShouldPersistTrustDecision =
+                decision.Action == DeviceDecisionAction.AllowAndWhitelist || decision.NeverAskAgain;
+
+            if (result.ShouldPersistTrustDecision)
                 _whitelist.Trust(fingerprint);
 
             result.UserDecision = decision;

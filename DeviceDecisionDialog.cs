@@ -55,7 +55,7 @@ namespace USBGuardian
 
             var chkNeverAsk = new CheckBox
             {
-                Text = "Never ask again for this trusted device",
+                Text = "Trust this device and never ask again",
                 Location = new Point(20, 345),
                 Size = new Size(420, 24),
                 Checked = false
@@ -134,7 +134,7 @@ namespace USBGuardian
         {
             var info = request.DeviceInformation;
             return
-                "Unknown USB storage device detected.\r\n\r\n" +
+                "Unknown USB device detected.\r\n\r\n" +
                 $"VID:PID: {info.VidPid}\r\n" +
                 $"Manufacturer: {info.Manufacturer}\r\n" +
                 $"Product: {info.ProductName}\r\n" +

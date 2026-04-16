@@ -588,13 +588,8 @@ namespace USBGuardian
                     }
                 }
 
-                bool addWhitelist =
-                    decision.UserDecision.Action == DeviceDecisionAction.AllowAndWhitelist ||
-                    decision.UserDecision.NeverAskAgain;
-
-                if (addWhitelist)
+                if (decision.ShouldPersistTrustDecision)
                 {
-                    guardianCore.ApproveWhitelist(device);
                     whitelist.Add(device);
                     SaveWhitelist();
                     historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User approved unknown device and saved trust decision");

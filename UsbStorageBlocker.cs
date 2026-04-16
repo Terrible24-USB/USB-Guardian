@@ -35,6 +35,7 @@ namespace USBGuardian
         private static extern int CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
 
         private readonly SecurityEventLogger _logger;
+        private readonly DeviceInformationCollector _deviceInformationCollector;
 
         /// <summary>
         /// Optional persistent store for blocked-device records.
@@ -43,9 +44,10 @@ namespace USBGuardian
         /// </summary>
         public BlockedDeviceStore? Store { get; set; }
 
-        public UsbStorageBlocker(SecurityEventLogger logger)
+        public UsbStorageBlocker(SecurityEventLogger logger, DeviceInformationCollector? deviceInformationCollector = null)
         {
             _logger = logger;
+            _deviceInformationCollector = deviceInformationCollector ?? new DeviceInformationCollector();
         }
 
         /// <summary>
@@ -85,7 +87,7 @@ namespace USBGuardian
             string vidPid = $"{device.Vid}:{device.Pid}";
             bool anySuccess = false;
             var actions = new List<BlockActionRecord>();
-            var deviceInfo = new DeviceInformationCollector().Collect(device);
+            var deviceInfo = _deviceInformationCollector.Collect(device);
 
             try
             {
