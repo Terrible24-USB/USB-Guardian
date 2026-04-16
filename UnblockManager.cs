@@ -535,9 +535,6 @@ namespace USBGuardian
                                 // Null-safety and exception handling right before the risky invoke
                                 try
                                 {
-                                    if (obj == null)
-                                        throw new InvalidOperationException("ManagementObject is null");
-
                                     obj.InvokeMethod("Enable", null);
                                     enabled.Add(devId);
                                     Debug.WriteLine($"[UnblockManager] Enabled via WMI: {devId}");
@@ -548,9 +545,19 @@ namespace USBGuardian
                                     Debug.WriteLine($"[UnblockManager] {msg}");
                                     _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
                                 }
+                                catch (ManagementException mex) when (
+                                    mex.ErrorCode == ManagementStatus.NotFound ||
+                                    mex.ErrorCode == ManagementStatus.InvalidObject ||
+                                    mex.ErrorCode == ManagementStatus.InvalidQuery)
+                                {
+                                    string msg = $"WMI Enable skipped for '{devId}': device no longer available " +
+                                                 $"(WMI status: {mex.ErrorCode})";
+                                    Debug.WriteLine($"[UnblockManager] {msg}");
+                                    _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                }
                                 catch (ManagementException mex)
                                 {
-                                    string msg = $"WMI Enable failed for '{devId}' (Management error): {mex.Message}";
+                                    string msg = $"WMI Enable failed for '{devId}' (Management error: {mex.ErrorCode}): {mex.Message}";
                                     Debug.WriteLine($"[UnblockManager] {msg}");
                                     _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
                                 }
@@ -560,9 +567,16 @@ namespace USBGuardian
                                     Debug.WriteLine($"[UnblockManager] {msg}");
                                     _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
                                 }
+                                catch (NullReferenceException nre)
+                                {
+                                    string msg = $"WMI Enable failed for '{devId}' ({nre.GetType().Name}): {nre.Message} " +
+                                                 "(device may have been disconnected; skipping this node)";
+                                    Debug.WriteLine($"[UnblockManager] {msg}");
+                                    _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
+                                }
                                 catch (Exception ex)
                                 {
-                                    string msg = $"WMI Enable failed for '{devId}': {ex.Message} " +
+                                    string msg = $"WMI Enable failed for '{devId}' ({ex.GetType().Name}): {ex.Message} " +
                                                  "(device may already be active or temporarily absent — this is usually harmless)";
                                     Debug.WriteLine($"[UnblockManager] {msg}");
                                     _logger.LogInfo(0, "WmiEnableWarning", msg, $"{record.Vid}:{record.Pid}");
@@ -572,7 +586,7 @@ namespace USBGuardian
                             }
                             catch (Exception ex)
                             {
-                                Debug.WriteLine($"[UnblockManager] Error processing device in WMI enable loop: {ex.Message}");
+                                Debug.WriteLine($"[UnblockManager] Error processing device in WMI enable loop ({ex.GetType().Name}): {ex.Message}");
                             }
                         }
                     }
