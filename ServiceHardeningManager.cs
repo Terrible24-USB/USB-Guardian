@@ -56,17 +56,22 @@ namespace USBGuardian
             try
             {
                 const string explorerPolicies = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer";
-                using var key = Registry.LocalMachine.OpenSubKey(explorerPolicies, writable: true)
-                    ?? Registry.LocalMachine.CreateSubKey(explorerPolicies, writable: true);
+                RegistryKey? key = Registry.LocalMachine.OpenSubKey(explorerPolicies, writable: true);
+                if (key == null)
+                    key = Registry.LocalMachine.CreateSubKey(explorerPolicies, writable: true);
+
                 if (key == null)
                 {
                     logger?.LogWarning(0, "ServiceHardening", "Failed to open Explorer policy key for AutoRun disable.");
                     return;
                 }
 
-                key.SetValue("NoAutoRun", 1, RegistryValueKind.DWord);
-                key.SetValue("NoDriveTypeAutoRun", 0xFF, RegistryValueKind.DWord);
-                logger?.LogPreBootAction("ServiceHardening", "AutoRun/AutoPlay policies disabled at HKLM.");
+                using (key)
+                {
+                    key.SetValue("NoAutoRun", 1, RegistryValueKind.DWord);
+                    key.SetValue("NoDriveTypeAutoRun", 0xFF, RegistryValueKind.DWord);
+                    logger?.LogPreBootAction("ServiceHardening", "AutoRun/AutoPlay policies disabled at HKLM.");
+                }
             }
             catch (Exception ex)
             {

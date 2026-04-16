@@ -20,16 +20,7 @@ namespace USBGuardian
         [STAThread]
         static void Main()
         {
-            try
-            {
-                PreBootSecurityManager.InitializePreBootBlocking();
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[Main] Pre-boot initialization failed: {ex.Message}");
-            }
-
-            ProgramBase.EnsureStartupSecurity(includePreBoot: false);
+            ProgramBase.EnsureStartupSecurity();
 
             // Create console window
             AllocConsole();
@@ -135,7 +126,6 @@ namespace USBGuardian
 
             // Initialize the redesigned security engine core
             guardianCore = new UsbGuardianCore();
-            ProgramBase.EnsureStartupSecurity(guardianCore.EventLogger, includePreBoot: false);
             _ = guardianCore.InitializeAsync();
 
             // Initialize the blocked-device store and unblock manager

@@ -2,6 +2,7 @@ using Microsoft.Win32;
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace USBGuardian
@@ -31,10 +32,15 @@ namespace USBGuardian
 
         public bool TemporarilyEnableUsbStorage(string vidPid, int enableDurationSeconds = 60)
         {
-            return TemporarilyEnableUsbStorageAsync(vidPid, enableDurationSeconds).GetAwaiter().GetResult();
+            return TemporarilyEnableUsbStorageCore(vidPid, enableDurationSeconds);
         }
 
         public async Task<bool> TemporarilyEnableUsbStorageAsync(string vidPid, int enableDurationSeconds = 60)
+        {
+            return await Task.Run(() => TemporarilyEnableUsbStorageCore(vidPid, enableDurationSeconds)).ConfigureAwait(false);
+        }
+
+        private bool TemporarilyEnableUsbStorageCore(string vidPid, int enableDurationSeconds)
         {
             if (string.IsNullOrWhiteSpace(vidPid))
                 return false;
@@ -42,13 +48,13 @@ namespace USBGuardian
             try
             {
                 ServiceHardeningManager.EnableUsbStorManual(_logger);
-                await Task.Delay(100).ConfigureAwait(false);
+                Thread.Sleep(100);
 
                 ClearConfigFlagsForVidPid(vidPid);
-                await Task.Delay(100).ConfigureAwait(false);
+                Thread.Sleep(100);
 
                 TriggerDeviceRescan();
-                await Task.Delay(500).ConfigureAwait(false);
+                Thread.Sleep(500);
 
                 _enabledDeviceVidPid = vidPid;
                 _enabledUntilUtc = DateTime.UtcNow.AddSeconds(enableDurationSeconds);
@@ -57,14 +63,21 @@ namespace USBGuardian
 
                 _ = Task.Run(async () =>
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(enableDurationSeconds)).ConfigureAwait(false);
-                    if (!string.Equals(_enabledDeviceVidPid, vidPid, StringComparison.OrdinalIgnoreCase))
-                        return;
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(enableDurationSeconds)).ConfigureAwait(false);
+                        if (!string.Equals(_enabledDeviceVidPid, vidPid, StringComparison.OrdinalIgnoreCase))
+                            return;
 
-                    _enabledDeviceVidPid = null;
-                    _enabledUntilUtc = null;
-                    PreBootSecurityManager.InitializePreBootBlocking(_logger);
-                    _logger.LogPreBootAction("TemporaryEnable", $"Temporary USB storage window expired for {vidPid}.", SecuritySeverity.Warning, vidPid);
+                        _enabledDeviceVidPid = null;
+                        _enabledUntilUtc = null;
+                        PreBootSecurityManager.InitializePreBootBlocking(_logger);
+                        _logger.LogPreBootAction("TemporaryEnable", $"Temporary USB storage window expired for {vidPid}.", SecuritySeverity.Warning, vidPid);
+                    }
+                    catch (Exception delayedEx)
+                    {
+                        _logger.LogWarning(0, "TemporaryEnable", $"Failed to re-engage pre-boot block for {vidPid}: {delayedEx.Message}", vidPid);
+                    }
                 });
 
                 return true;
@@ -137,6 +150,8 @@ namespace USBGuardian
                     CM_Reenumerate_DevNode(devInst, CM_REENUMERATE_NORMAL);
                     return;
                 }
+
+                _logger.LogWarning(0, "TemporaryEnable", $"Device rescan locate call failed (code={locate}).");
             }
             catch (Exception ex)
             {
