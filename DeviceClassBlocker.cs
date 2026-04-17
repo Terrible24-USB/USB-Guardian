@@ -28,8 +28,8 @@ namespace USBGuardian
             { 0xEF, "Composite" }
         };
 
-        private static readonly HashSet<string> CriticalClasses = new() { "08", "09", "FF" };
-        private static readonly HashSet<string> HighThreatClasses = new() { "02", "07", "01", "E0", "EF" };
+        private static readonly HashSet<string> CriticalClasses = new() { "09", "FF" };
+        private static readonly HashSet<string> HighThreatClasses = new() { "08", "02", "07", "01", "E0", "EF" };
 
         // Whitelisted VID:PID pairs (e.g., "046D:C52B" for Logitech Unifying Receiver)
         private static readonly HashSet<string> WhitelistedVidPids = new(StringComparer.OrdinalIgnoreCase)
