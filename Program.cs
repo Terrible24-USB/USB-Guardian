@@ -10,6 +10,7 @@ using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 using System.Xml.Serialization;
 
@@ -20,7 +21,7 @@ namespace USBGuardian
         [STAThread]
         static void Main()
         {
-            ProgramBase.EnsureStartupSecurity();
+            ProgramBase.EnsureStartupSecurity(includePreBoot: false);
 
             // Create console window
             AllocConsole();
@@ -93,6 +94,9 @@ namespace USBGuardian
         private const int RaceWindowFirstRecheckMs  = 250;
         private const int RaceWindowSecondRecheckMs = 750;
         private const int DeviceRecoveryTimeoutMs   = 2000;
+        private const int AllowRecoveryRetryAttempts = 3;
+        private const int DecisionPromptDebounceMs  = 1500;
+        private const int DecisionDialogTimeoutSeconds = 20;
 
         private static readonly Guid GUID_DEVINTERFACE_USB_DEVICE =
             new Guid("A5DCBF10-6530-11D2-901F-00C04FB951ED");
@@ -107,10 +111,15 @@ namespace USBGuardian
         private NotifyIcon trayIcon;
         private EmergencyRecoveryManager emergencyRecoveryManager;
         private IntelligentUsbBlocker intelligentUsbBlocker;
+        private readonly SynchronizationContext _uiContext;
+        private readonly object _decisionPromptLock = new();
+        private readonly HashSet<string> _pendingDecisionKeys = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> _lastDecisionPromptUtc = new(StringComparer.OrdinalIgnoreCase);
 
         public USBMessageWindow()
         {
             CreateHandle(new CreateParams());
+            _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
 
             try
             {
@@ -492,7 +501,36 @@ namespace USBGuardian
                 }
 
                 Debug.WriteLine("⚠️ DEVICE DECISION REQUIRED - Showing allow/block dialog");
-                DeviceDecisionAction userDecision = ShowDeviceDecisionDialog(currentDevice, evalResult);
+                string decisionKey = $"{vid}:{pid}:{instanceId}";
+                if (!TryBeginDecisionPrompt(decisionKey))
+                {
+                    Debug.WriteLine($"[DecisionPrompt] Debounced duplicate prompt for {decisionKey}");
+                    return;
+                }
+
+                DeviceDecisionResult decisionResult;
+                try
+                {
+                    decisionResult = ShowDeviceDecisionDialog(currentDevice, evalResult);
+                }
+                finally
+                {
+                    EndDecisionPrompt(decisionKey);
+                }
+
+                DeviceDecisionAction userDecision = decisionResult.Action;
+                if (decisionResult.PromptFailed)
+                {
+                    ShowBalloonTip(
+                        "⚠ Decision UI Unavailable",
+                        $"Could not display allow/block prompt for {currentDevice.Description ?? "Unknown Device"}. Failing safe to Block.");
+                }
+                else if (decisionResult.TimedOut)
+                {
+                    ShowBalloonTip(
+                        "⏱ Decision Timed Out",
+                        $"No decision was made for {currentDevice.Description ?? "Unknown Device"}. The device was blocked for safety.");
+                }
 
                 if (userDecision == DeviceDecisionAction.AllowOnce ||
                     userDecision == DeviceDecisionAction.AllowAndWhitelist)
@@ -504,7 +542,10 @@ namespace USBGuardian
                         guardianCore.ApproveWhitelist(currentDevice);
                     }
 
-                    UnblockResult recoveryResult = guardianCore.RecoverAllowedDevice(currentDevice, unblockManager, DeviceRecoveryTimeoutMs);
+                    UnblockResult recoveryResult = RunAllowRecoveryWithRetry(
+                        currentDevice,
+                        DeviceRecoveryTimeoutMs,
+                        AllowRecoveryRetryAttempts);
                     foreach (string msg in recoveryResult.Messages)
                         Debug.WriteLine($"[AllowRecovery] {msg}");
 
@@ -543,11 +584,11 @@ namespace USBGuardian
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error processing USB device: {ex.Message}");
+                Debug.WriteLine($"Error processing USB device: {ex}");
             }
         }
 
-        private DeviceDecisionAction ShowDeviceDecisionDialog(
+        private DeviceDecisionResult ShowDeviceDecisionDialog(
             DeviceFingerprint device,
             DeviceEvaluationResult evaluationResult)
         {
@@ -579,8 +620,90 @@ namespace USBGuardian
                     "Choose Allow Once to permit this insertion only, Allow & Whitelist to trust permanently, or Block to deny access."
             };
 
-            DeviceDecisionResult decision = DeviceDecisionDialog.ShowDecision(request);
-            return decision.Action;
+            Debug.WriteLine($"[DecisionPrompt] Invoking dialog for {info.VidPid} on thread {Thread.CurrentThread.ManagedThreadId}");
+
+            try
+            {
+                if (SynchronizationContext.Current == _uiContext)
+                    return DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds);
+
+                DeviceDecisionResult decision = new() { Action = DeviceDecisionAction.Block };
+                _uiContext.Send(_ =>
+                {
+                    decision = DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds);
+                }, null);
+                return decision;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[DecisionPrompt] Dialog invocation failed for {info.VidPid}: {ex}");
+                return new DeviceDecisionResult
+                {
+                    Action = DeviceDecisionAction.Block,
+                    PromptFailed = true
+                };
+            }
+        }
+
+        private bool TryBeginDecisionPrompt(string decisionKey)
+        {
+            DateTime now = DateTime.UtcNow;
+            lock (_decisionPromptLock)
+            {
+                if (_pendingDecisionKeys.Contains(decisionKey))
+                    return false;
+
+                if (_lastDecisionPromptUtc.TryGetValue(decisionKey, out DateTime lastPromptUtc) &&
+                    (now - lastPromptUtc).TotalMilliseconds < DecisionPromptDebounceMs)
+                {
+                    return false;
+                }
+
+                _pendingDecisionKeys.Add(decisionKey);
+                _lastDecisionPromptUtc[decisionKey] = now;
+                return true;
+            }
+        }
+
+        private void EndDecisionPrompt(string decisionKey)
+        {
+            lock (_decisionPromptLock)
+                _pendingDecisionKeys.Remove(decisionKey);
+        }
+
+        private UnblockResult RunAllowRecoveryWithRetry(
+            DeviceFingerprint device,
+            int waitTimeoutMs,
+            int maxAttempts)
+        {
+            if (maxAttempts < 1)
+                throw new ArgumentOutOfRangeException(nameof(maxAttempts), "maxAttempts must be at least 1.");
+
+            var result = new UnblockResult
+            {
+                NeedsReplug = true
+            };
+
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                UnblockResult attemptResult = guardianCore.RecoverAllowedDevice(device, unblockManager, waitTimeoutMs);
+                result.Messages.AddRange(attemptResult.Messages.Select(m => $"Attempt {attempt}/{maxAttempts}: {m}"));
+                result.NeedsReplug = attemptResult.NeedsReplug;
+
+                if (!attemptResult.NeedsReplug)
+                {
+                    result.Messages.Add($"Allow recovery succeeded on attempt {attempt}/{maxAttempts}.");
+                    break;
+                }
+
+                if (attempt < maxAttempts)
+                {
+                    result.Messages.Add($"Allow recovery still pending after attempt {attempt}/{maxAttempts}; retrying.");
+                    Thread.Sleep(250);
+                }
+            }
+
+            return result;
         }
 
         private void HandleUnknownDevice(DeviceFingerprint device, DeviceEvaluationResult? evaluationResult = null)

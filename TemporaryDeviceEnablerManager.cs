@@ -71,12 +71,14 @@ namespace USBGuardian
 
                         _enabledDeviceVidPid = null;
                         _enabledUntilUtc = null;
-                        PreBootSecurityManager.InitializePreBootBlocking(_logger);
-                        _logger.LogPreBootAction("TemporaryEnable", $"Temporary USB storage window expired for {vidPid}.", SecuritySeverity.Warning, vidPid);
+                        _logger.LogPreBootAction("TemporaryEnable",
+                            $"Temporary USB storage window expired for {vidPid}. No persistent pre-boot block re-applied.",
+                            SecuritySeverity.Warning,
+                            vidPid);
                     }
                     catch (Exception delayedEx)
                     {
-                        _logger.LogWarning(0, "TemporaryEnable", $"Failed to re-engage pre-boot block for {vidPid}: {delayedEx.Message}", vidPid);
+                        _logger.LogWarning(0, "TemporaryEnable", $"Temporary enable expiration handler failed for {vidPid}: {delayedEx.Message}", vidPid);
                     }
                 });
 

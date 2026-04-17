@@ -7,7 +7,7 @@ namespace USBGuardian
         private static readonly object InitLock = new();
         private static bool _initialized;
 
-        public static void EnsureStartupSecurity(SecurityEventLogger? logger = null, bool includePreBoot = true)
+        public static void EnsureStartupSecurity(SecurityEventLogger? logger = null, bool includePreBoot = false)
         {
             lock (InitLock)
             {
@@ -20,6 +20,15 @@ namespace USBGuardian
                 catch (Exception ex)
                 {
                     logger?.LogWarning(0, "BootRecovery", $"Emergency recovery check failed: {ex.Message}");
+                }
+
+                try
+                {
+                    PreBootSecurityManager.ReconcileStalePreBootState(logger);
+                }
+                catch (Exception ex)
+                {
+                    logger?.LogWarning(0, "PreBootRecovery", $"Stale pre-boot recovery check failed: {ex.Message}");
                 }
 
                 if (includePreBoot)
