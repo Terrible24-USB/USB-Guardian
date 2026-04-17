@@ -50,6 +50,16 @@ namespace USBGuardian
                 TopMost = true,
                 ShowInTaskbar = true
             };
+            form.Shown += (_, _) =>
+            {
+                try
+                {
+                    form.WindowState = FormWindowState.Normal;
+                    form.Activate();
+                    form.BringToFront();
+                }
+                catch { }
+            };
 
             var txtDetails = new TextBox
             {
