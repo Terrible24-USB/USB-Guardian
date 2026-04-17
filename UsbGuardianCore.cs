@@ -163,5 +163,43 @@ namespace USBGuardian
             }
         }
 
+        public UnblockResult RecoverAllowedDevice(
+            DeviceFingerprint device,
+            UnblockManager unblockManager,
+            int waitTimeoutMs = 2000)
+        {
+            var result = new UnblockResult();
+
+            if (device == null)
+            {
+                result.Messages.Add("Allow recovery skipped: device is null.");
+                result.NeedsReplug = true;
+                return result;
+            }
+
+            if (unblockManager == null)
+            {
+                result.Messages.Add("Allow recovery skipped: UnblockManager is unavailable.");
+                result.NeedsReplug = true;
+                return result;
+            }
+
+            string vidPid = $"{device.Vid}:{device.Pid}";
+            _eventLogger.LogInfo(0, "AllowRecovery",
+                $"Starting allow recovery for {vidPid}", vidPid);
+
+            try
+            {
+                return unblockManager.RecoverEvaluatingDevice(device, waitTimeoutMs);
+            }
+            catch (Exception ex)
+            {
+                result.Messages.Add($"Allow recovery failed: {ex.Message}");
+                result.NeedsReplug = true;
+                Debug.WriteLine($"[UsbGuardianCore] RecoverAllowedDevice failed: {ex.Message}");
+                return result;
+            }
+        }
+
     }
 }
