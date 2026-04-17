@@ -9,6 +9,7 @@ namespace USBGuardian
     {
         private const int ConfigFlagDisabled = 0x100;
         private const int ConfigFlagReinstall = 0x40;
+        private const string UsbStorEnumPath = @"SYSTEM\CurrentControlSet\Enum\USBSTOR";
 
         public static void InitializePreBootBlocking(SecurityEventLogger? logger = null)
         {
@@ -39,12 +40,34 @@ namespace USBGuardian
             return Path.Combine(root, "preboot.lock");
         }
 
-        private static void DisableAllUsbStorInstances(SecurityEventLogger? logger)
+        public static void ReconcileStalePreBootState(SecurityEventLogger? logger = null)
         {
-            const string enumPath = @"SYSTEM\CurrentControlSet\Enum\USBSTOR";
             try
             {
-                using var root = Registry.LocalMachine.OpenSubKey(enumPath);
+                string lockFile = GetLockFilePath();
+                if (!File.Exists(lockFile))
+                    return;
+
+                logger?.LogPreBootAction("Recovery",
+                    "Detected stale pre-boot lock from a previous run. Restoring USBSTOR instance flags.");
+                ClearUsbStorDisableFlags(logger);
+                ServiceHardeningManager.EnableUsbStorManual(logger);
+                File.Delete(lockFile);
+                logger?.LogPreBootAction("Recovery",
+                    "Stale pre-boot lock state reconciled successfully.");
+            }
+            catch (Exception ex)
+            {
+                logger?.LogWarning(0, "Recovery", $"Failed to reconcile stale pre-boot lock state: {ex.Message}");
+                Debug.WriteLine($"[PreBoot] Reconcile error: {ex.Message}");
+            }
+        }
+
+        private static void DisableAllUsbStorInstances(SecurityEventLogger? logger)
+        {
+            try
+            {
+                using var root = Registry.LocalMachine.OpenSubKey(UsbStorEnumPath);
                 if (root == null)
                 {
                     logger?.LogPreBootAction("InstanceHardening", "No USBSTOR instances found in registry.");
@@ -58,7 +81,7 @@ namespace USBGuardian
 
                     foreach (string instanceNode in classKey.GetSubKeyNames())
                     {
-                        string path = $@"{enumPath}\{deviceClassNode}\{instanceNode}";
+                        string path = $@"{UsbStorEnumPath}\{deviceClassNode}\{instanceNode}";
                         try
                         {
                             using var key = Registry.LocalMachine.OpenSubKey(path, writable: true);
@@ -81,6 +104,43 @@ namespace USBGuardian
             catch (Exception ex)
             {
                 logger?.LogWarning(0, "InstanceHardening", $"USBSTOR enumeration failed: {ex.Message}");
+            }
+        }
+
+        private static void ClearUsbStorDisableFlags(SecurityEventLogger? logger)
+        {
+            using var root = Registry.LocalMachine.OpenSubKey(UsbStorEnumPath);
+            if (root == null)
+            {
+                logger?.LogPreBootAction("Recovery", "No USBSTOR instances found during stale lock recovery.");
+                return;
+            }
+
+            foreach (string deviceClassNode in root.GetSubKeyNames())
+            {
+                using var classKey = root.OpenSubKey(deviceClassNode);
+                if (classKey == null) continue;
+
+                foreach (string instanceNode in classKey.GetSubKeyNames())
+                {
+                    string path = $@"{UsbStorEnumPath}\{deviceClassNode}\{instanceNode}";
+                    try
+                    {
+                        using var key = Registry.LocalMachine.OpenSubKey(path, writable: true);
+                        if (key == null) continue;
+
+                        int current = key.GetValue("ConfigFlags") is int f ? f : 0;
+                        int restored = current & ~(ConfigFlagDisabled | ConfigFlagReinstall);
+                        key.SetValue("ConfigFlags", restored, RegistryValueKind.DWord);
+                        logger?.LogPreBootAction("Recovery",
+                            $"Cleared stale pre-boot ConfigFlags on '{deviceClassNode}\\{instanceNode}' (0x{current:X}→0x{restored:X}).");
+                    }
+                    catch (Exception ex)
+                    {
+                        logger?.LogWarning(0, "Recovery",
+                            $"Failed clearing stale ConfigFlags on '{deviceClassNode}\\{instanceNode}': {ex.Message}");
+                    }
+                }
             }
         }
 

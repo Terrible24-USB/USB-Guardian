@@ -24,11 +24,16 @@ namespace USBGuardian
     {
         public DeviceDecisionAction Action { get; set; } = DeviceDecisionAction.Block;
         public bool NeverAskAgain { get; set; }
+        public bool TimedOut { get; set; }
+        public bool PromptFailed { get; set; }
     }
 
     public static class DeviceDecisionDialog
     {
         public static DeviceDecisionResult ShowDecision(DeviceDecisionRequest request)
+            => ShowDecision(request, 20);
+
+        public static DeviceDecisionResult ShowDecision(DeviceDecisionRequest request, int timeoutSeconds = 20)
         {
             if (request == null) throw new ArgumentNullException(nameof(request));
 
@@ -40,7 +45,9 @@ namespace USBGuardian
                 StartPosition = FormStartPosition.CenterScreen,
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 MaximizeBox = false,
-                MinimizeBox = false
+                MinimizeBox = false,
+                TopMost = true,
+                ShowInTaskbar = true
             };
 
             var txtDetails = new TextBox
@@ -78,7 +85,7 @@ namespace USBGuardian
 
             var btnWhitelist = new Button
             {
-                Text = "Whitelist Device",
+                Text = "Allow & Whitelist",
                 Location = new Point(175, 385),
                 Size = new Size(140, 40),
                 BackColor = Color.LightBlue
@@ -126,6 +133,18 @@ namespace USBGuardian
                 txtDetails, chkNeverAsk, btnAllow, btnWhitelist, btnBlock, btnIgnore
             });
 
+            using var timeoutTimer = new System.Windows.Forms.Timer();
+            timeoutTimer.Interval = Math.Max(1, timeoutSeconds) * 1000;
+            timeoutTimer.Tick += (_, _) =>
+            {
+                timeoutTimer.Stop();
+                result.Action = DeviceDecisionAction.Block;
+                result.TimedOut = true;
+                form.DialogResult = DialogResult.No;
+                form.Close();
+            };
+
+            timeoutTimer.Start();
             form.ShowDialog();
             return result;
         }
