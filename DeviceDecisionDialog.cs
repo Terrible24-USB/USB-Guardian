@@ -36,6 +36,7 @@ namespace USBGuardian
         public static DeviceDecisionResult ShowDecision(DeviceDecisionRequest request, int timeoutSeconds = 20)
         {
             if (request == null) throw new ArgumentNullException(nameof(request));
+            if (timeoutSeconds < 1) throw new ArgumentOutOfRangeException(nameof(timeoutSeconds));
 
             var result = new DeviceDecisionResult();
             using var form = new Form
@@ -134,7 +135,7 @@ namespace USBGuardian
             });
 
             using var timeoutTimer = new System.Windows.Forms.Timer();
-            timeoutTimer.Interval = Math.Max(1, timeoutSeconds) * 1000;
+            timeoutTimer.Interval = timeoutSeconds * 1000;
             timeoutTimer.Tick += (_, _) =>
             {
                 timeoutTimer.Stop();

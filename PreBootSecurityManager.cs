@@ -130,6 +130,8 @@ namespace USBGuardian
                         if (key == null) continue;
 
                         int current = key.GetValue("ConfigFlags") is int f ? f : 0;
+                        // Remove only USB Guardian's blocking bits (disabled + reinstall)
+                        // while preserving any other ConfigFlags managed by Windows/OEM.
                         int restored = current & ~(ConfigFlagDisabled | ConfigFlagReinstall);
                         key.SetValue("ConfigFlags", restored, RegistryValueKind.DWord);
                         logger?.LogPreBootAction("Recovery",

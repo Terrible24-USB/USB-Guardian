@@ -94,7 +94,7 @@ namespace USBGuardian
         private const int RaceWindowFirstRecheckMs  = 250;
         private const int RaceWindowSecondRecheckMs = 750;
         private const int DeviceRecoveryTimeoutMs   = 2000;
-        private const int AllowRecoveryRetryCount   = 3;
+        private const int AllowRecoveryRetryAttempts = 3;
         private const int DecisionPromptDebounceMs  = 1500;
         private const int DecisionDialogTimeoutSeconds = 20;
 
@@ -545,7 +545,7 @@ namespace USBGuardian
                     UnblockResult recoveryResult = RunAllowRecoveryWithRetry(
                         currentDevice,
                         DeviceRecoveryTimeoutMs,
-                        AllowRecoveryRetryCount);
+                        AllowRecoveryRetryAttempts);
                     foreach (string msg in recoveryResult.Messages)
                         Debug.WriteLine($"[AllowRecovery] {msg}");
 
@@ -676,27 +676,29 @@ namespace USBGuardian
             int waitTimeoutMs,
             int maxAttempts)
         {
+            if (maxAttempts < 1)
+                throw new ArgumentOutOfRangeException(nameof(maxAttempts), "maxAttempts must be at least 1.");
+
             var result = new UnblockResult
             {
                 NeedsReplug = true
             };
 
-            int attempts = Math.Max(1, maxAttempts);
-            for (int attempt = 1; attempt <= attempts; attempt++)
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
                 UnblockResult attemptResult = guardianCore.RecoverAllowedDevice(device, unblockManager, waitTimeoutMs);
-                result.Messages.AddRange(attemptResult.Messages.Select(m => $"Attempt {attempt}/{attempts}: {m}"));
+                result.Messages.AddRange(attemptResult.Messages.Select(m => $"Attempt {attempt}/{maxAttempts}: {m}"));
                 result.NeedsReplug = attemptResult.NeedsReplug;
 
                 if (!attemptResult.NeedsReplug)
                 {
-                    result.Messages.Add($"Allow recovery succeeded on attempt {attempt}/{attempts}.");
+                    result.Messages.Add($"Allow recovery succeeded on attempt {attempt}/{maxAttempts}.");
                     break;
                 }
 
-                if (attempt < attempts)
+                if (attempt < maxAttempts)
                 {
-                    result.Messages.Add($"Allow recovery still pending after attempt {attempt}/{attempts}; retrying.");
+                    result.Messages.Add($"Allow recovery still pending after attempt {attempt}/{maxAttempts}; retrying.");
                     Thread.Sleep(250);
                 }
             }
