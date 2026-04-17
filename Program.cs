@@ -97,6 +97,7 @@ namespace USBGuardian
         private const int AllowRecoveryRetryAttempts = 3;
         private const int DecisionPromptDebounceMs  = 1500;
         private const int DecisionDialogTimeoutSeconds = 20;
+        private const string TemporaryDecisionBlockReasonPrefix = "[TEMP_DECISION_PENDING]";
 
         private static readonly Guid GUID_DEVINTERFACE_USB_DEVICE =
             new Guid("A5DCBF10-6530-11D2-901F-00C04FB951ED");
@@ -112,14 +113,17 @@ namespace USBGuardian
         private EmergencyRecoveryManager emergencyRecoveryManager;
         private IntelligentUsbBlocker intelligentUsbBlocker;
         private readonly SynchronizationContext _uiContext;
+        private readonly int _uiThreadId;
         private readonly object _decisionPromptLock = new();
         private readonly HashSet<string> _pendingDecisionKeys = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _lastDecisionPromptUtc = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, BlockedDeviceRecord> _temporaryDecisionBlocks = new(StringComparer.OrdinalIgnoreCase);
 
         public USBMessageWindow()
         {
             CreateHandle(new CreateParams());
             _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+            _uiThreadId = Thread.CurrentThread.ManagedThreadId;
 
             try
             {
@@ -143,6 +147,7 @@ namespace USBGuardian
             // Initialize the blocked-device store and unblock manager
             blockedDeviceStore = new BlockedDeviceStore();
             unblockManager = new UnblockManager(blockedDeviceStore, guardianCore.EventLogger);
+            ReconcileStaleTemporaryDecisionBlocks();
 
             // Wire the store into the blocking managers so every block is recorded
             guardianCore.BlockingManager.Store = blockedDeviceStore;
@@ -397,6 +402,8 @@ namespace USBGuardian
             Debug.WriteLine($"VID: {vid}");
             Debug.WriteLine($"PID: {pid}");
             Debug.WriteLine($"InstanceId: {instanceId}");
+            string decisionKey = $"{vid}:{pid}:{instanceId}";
+            LogDecisionPipeline("DETECTED", decisionKey, null, $"Path={devicePath}");
 
             try
             {
@@ -407,9 +414,10 @@ namespace USBGuardian
                 // ~150–400 ms down to the few milliseconds it takes for a single registry
                 // read/write + cfgmgr32 rescan.  The block is reversed automatically if the
                 // full fingerprint later confirms the device is whitelisted.
-                // Do not pre-block before user decision; non-critical devices must present
-                // an allow/block dialog before any blocking action is applied.
-                bool earlyBlockApplied = false;
+                bool earlyBlockApplied = !string.IsNullOrWhiteSpace(instanceId)
+                    && EarlyBlockUsbInstanceKey(vid, pid, instanceId);
+                if (earlyBlockApplied)
+                    LogDecisionPipeline("TEMP_BLOCK_APPLIED", decisionKey, null, "Applied early ConfigFlags quarantine");
 
                 // Capture all identifiers
                 DeviceFingerprint currentDevice = deviceIdentifier.CaptureAllIdentifiers(
@@ -501,7 +509,10 @@ namespace USBGuardian
                 }
 
                 Debug.WriteLine("⚠️ DEVICE DECISION REQUIRED - Showing allow/block dialog");
-                string decisionKey = $"{vid}:{pid}:{instanceId}";
+                BlockedDeviceRecord? temporaryDecisionBlock = null;
+                if (UsbStorageBlocker.IsUsbStorageDevice(currentDevice))
+                    temporaryDecisionBlock = EnsureTemporaryDecisionBlock(currentDevice, decisionKey);
+
                 if (!TryBeginDecisionPrompt(decisionKey))
                 {
                     Debug.WriteLine($"[DecisionPrompt] Debounced duplicate prompt for {decisionKey}");
@@ -511,6 +522,8 @@ namespace USBGuardian
                 DeviceDecisionResult decisionResult;
                 try
                 {
+                    LogDecisionPipeline("PROMPT_SHOWN", decisionKey, currentDevice,
+                        $"PromptThread={Thread.CurrentThread.ManagedThreadId}");
                     decisionResult = ShowDeviceDecisionDialog(currentDevice, evalResult);
                 }
                 finally
@@ -519,15 +532,17 @@ namespace USBGuardian
                 }
 
                 DeviceDecisionAction userDecision = decisionResult.Action;
+                LogDecisionPipeline("USER_DECISION", decisionKey, currentDevice,
+                    $"Action={userDecision};TimedOut={decisionResult.TimedOut};PromptFailed={decisionResult.PromptFailed}");
                 if (decisionResult.PromptFailed)
                 {
-                    ShowBalloonTip(
+                    ShowFailClosedNotification(
                         "⚠ Decision UI Unavailable",
                         $"Could not display allow/block prompt for {currentDevice.Description ?? "Unknown Device"}. Failing safe to Block.");
                 }
                 else if (decisionResult.TimedOut)
                 {
-                    ShowBalloonTip(
+                    ShowFailClosedNotification(
                         "⏱ Decision Timed Out",
                         $"No decision was made for {currentDevice.Description ?? "Unknown Device"}. The device was blocked for safety.");
                 }
@@ -535,6 +550,14 @@ namespace USBGuardian
                 if (userDecision == DeviceDecisionAction.AllowOnce ||
                     userDecision == DeviceDecisionAction.AllowAndWhitelist)
                 {
+                    if (temporaryDecisionBlock != null)
+                    {
+                        UnblockResult tempUnblockResult = unblockManager.UnblockDevice(temporaryDecisionBlock);
+                        foreach (string msg in tempUnblockResult.Messages)
+                            Debug.WriteLine($"[TempDecisionUnblock] {msg}");
+                        RemoveTemporaryDecisionBlock(decisionKey);
+                    }
+
                     if (userDecision == DeviceDecisionAction.AllowAndWhitelist)
                     {
                         whitelist.Add(currentDevice);
@@ -542,12 +565,21 @@ namespace USBGuardian
                         guardianCore.ApproveWhitelist(currentDevice);
                     }
 
+                    LogDecisionPipeline("REENUM_STARTED", decisionKey, currentDevice,
+                        $"Attempts={AllowRecoveryRetryAttempts};TimeoutMs={DeviceRecoveryTimeoutMs}");
                     UnblockResult recoveryResult = RunAllowRecoveryWithRetry(
                         currentDevice,
                         DeviceRecoveryTimeoutMs,
                         AllowRecoveryRetryAttempts);
                     foreach (string msg in recoveryResult.Messages)
                         Debug.WriteLine($"[AllowRecovery] {msg}");
+                    LogDecisionPipeline(
+                        recoveryResult.NeedsReplug ? "REENUM_FAILED" : "REENUM_DONE",
+                        decisionKey,
+                        currentDevice,
+                        recoveryResult.NeedsReplug
+                            ? "Recovery completed with replug required"
+                            : "Recovery completed and device is ready");
 
                     if (UsbStorageBlocker.IsUsbStorageDevice(currentDevice))
                         guardianCore.TemporarilyEnableUsbStorage(currentDevice, 60);
@@ -566,6 +598,8 @@ namespace USBGuardian
                     ShowBalloonTip(allowTitle, allowText);
                     return;
                 }
+
+                RemoveTemporaryDecisionBlock(decisionKey);
 
                 string blockReason = string.IsNullOrWhiteSpace(evalResult.BlockReason)
                     ? "Blocked by user decision"
@@ -624,7 +658,7 @@ namespace USBGuardian
 
             try
             {
-                if (SynchronizationContext.Current == _uiContext)
+                if (Thread.CurrentThread.ManagedThreadId == _uiThreadId)
                     return DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds);
 
                 DeviceDecisionResult decision = new() { Action = DeviceDecisionAction.Block };
@@ -643,6 +677,40 @@ namespace USBGuardian
                     PromptFailed = true
                 };
             }
+        }
+
+        private BlockedDeviceRecord? EnsureTemporaryDecisionBlock(DeviceFingerprint device, string decisionKey)
+        {
+            lock (_decisionPromptLock)
+            {
+                if (_temporaryDecisionBlocks.TryGetValue(decisionKey, out BlockedDeviceRecord existing))
+                    return existing;
+            }
+
+            try
+            {
+                BlockedDeviceRecord record = ImmediateBlockForWhitelistEnforcement(
+                    device,
+                    temporaryForDecision: true,
+                    decisionKey: decisionKey);
+
+                lock (_decisionPromptLock)
+                    _temporaryDecisionBlocks[decisionKey] = record;
+
+                LogDecisionPipeline("TEMP_BLOCK_APPLIED", decisionKey, device, "Temporary decision quarantine applied");
+                return record;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[DecisionQuarantine] Failed to apply temporary block for {decisionKey}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private void RemoveTemporaryDecisionBlock(string decisionKey)
+        {
+            lock (_decisionPromptLock)
+                _temporaryDecisionBlocks.Remove(decisionKey);
         }
 
         private bool TryBeginDecisionPrompt(string decisionKey)
@@ -1222,7 +1290,10 @@ namespace USBGuardian
         /// Returns the <see cref="BlockedDeviceRecord"/> that was persisted so the
         /// caller can reverse the block if the user subsequently allows the device.
         /// </summary>
-        private BlockedDeviceRecord ImmediateBlockForWhitelistEnforcement(DeviceFingerprint device)
+        private BlockedDeviceRecord ImmediateBlockForWhitelistEnforcement(
+            DeviceFingerprint device,
+            bool temporaryForDecision = false,
+            string? decisionKey = null)
         {
             string vidPid    = $"{device.Vid}:{device.Pid}";
             string timestamp = DateTime.UtcNow.ToString("o");
@@ -1269,6 +1340,10 @@ namespace USBGuardian
             TriggerRescanForBlock(vidPid);
 
             // Persist record so the caller can call UnblockDevice if the user allows the device
+            string reason = temporaryForDecision
+                ? $"{TemporaryDecisionBlockReasonPrefix} DecisionKey={decisionKey ?? "unknown"}; pending explicit user decision ({timestamp})"
+                : $"Whitelist enforcement: unapproved storage device blocked at detection ({timestamp})";
+
             var record = new BlockedDeviceRecord
             {
                 Vid          = device.Vid          ?? string.Empty,
@@ -1277,8 +1352,7 @@ namespace USBGuardian
                 SerialNumber = device.SerialNumber ?? string.Empty,
                 Description  = device.Description  ?? string.Empty,
                 PnpDeviceId  = device.DeviceId     ?? string.Empty,
-                BlockReason  =
-                    $"Whitelist enforcement: unapproved storage device blocked at detection ({timestamp})",
+                BlockReason  = reason,
                 Actions = actions
             };
             blockedDeviceStore.AddOrUpdate(record);
@@ -1334,14 +1408,75 @@ namespace USBGuardian
         {
             try
             {
+                if (trayIcon != null)
+                {
+                    trayIcon.BalloonTipTitle = title;
+                    trayIcon.BalloonTipText = text;
+                    trayIcon.BalloonTipIcon = ToolTipIcon.Info;
+                    trayIcon.ShowBalloonTip(5000);
+                    return;
+                }
+
                 using (var notifyIcon = new NotifyIcon())
                 {
                     notifyIcon.Icon = SystemIcons.Information;
                     notifyIcon.Visible = true;
-                    notifyIcon.ShowBalloonTip(3000, title, text, ToolTipIcon.Info);
+                    notifyIcon.ShowBalloonTip(5000, title, text, ToolTipIcon.Info);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Notification] Balloon tip failed: {ex.Message}");
+            }
+        }
+
+        private void ShowFailClosedNotification(string title, string text)
+        {
+            ShowBalloonTip(title, text);
+            try
+            {
+                _uiContext.Post(_ =>
+                {
+                    try
+                    {
+                        MessageBox.Show(
+                            text,
+                            title,
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning,
+                            MessageBoxDefaultButton.Button1,
+                            MessageBoxOptions.DefaultDesktopOnly);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[Notification] Fail-closed message box failed: {ex.Message}");
+                    }
+                }, null);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Notification] Fail-closed fallback scheduling failed: {ex.Message}");
+            }
+        }
+
+        private void LogDecisionPipeline(string stage, string decisionKey, DeviceFingerprint? device, string details = "")
+        {
+            string vidPid = device != null
+                ? $"{device.Vid}:{device.Pid}"
+                : decisionKey;
+            string message = string.IsNullOrWhiteSpace(details)
+                ? $"[USB_DECISION_GATE] {stage} | Key={decisionKey} | Device={vidPid}"
+                : $"[USB_DECISION_GATE] {stage} | Key={decisionKey} | Device={vidPid} | {details}";
+
+            Debug.WriteLine(message);
+            try
+            {
+                guardianCore?.EventLogger?.LogInfo(0, "UsbDecisionGate", message, vidPid);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[UsbDecisionGate] Event log write failed: {ex.Message}");
+            }
         }
 
         private List<DeviceFingerprint> LoadWhitelist()
@@ -1602,6 +1737,47 @@ namespace USBGuardian
             {
                 Debug.WriteLine($"[StartupCheck] USBSTOR orphan check error: {ex.Message}");
             }
+        }
+
+        private void ReconcileStaleTemporaryDecisionBlocks()
+        {
+            try
+            {
+                List<BlockedDeviceRecord> staleRecords = blockedDeviceStore
+                    .GetAll()
+                    .Where(IsTemporaryDecisionBlockRecord)
+                    .ToList();
+
+                if (staleRecords.Count == 0)
+                    return;
+
+                Debug.WriteLine($"[StartupRecovery] Reconciling {staleRecords.Count} stale temporary decision block(s).");
+
+                foreach (BlockedDeviceRecord record in staleRecords)
+                {
+                    try
+                    {
+                        UnblockResult result = unblockManager.UnblockDevice(record, removeFromStore: true);
+                        foreach (string msg in result.Messages)
+                            Debug.WriteLine($"[StartupRecovery] {record.Vid}:{record.Pid} - {msg}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[StartupRecovery] Failed to reconcile stale temporary block {record.Vid}:{record.Pid}: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[StartupRecovery] Temporary decision block reconciliation failed: {ex.Message}");
+            }
+        }
+
+        private static bool IsTemporaryDecisionBlockRecord(BlockedDeviceRecord record)
+        {
+            return record != null &&
+                   !string.IsNullOrWhiteSpace(record.BlockReason) &&
+                   record.BlockReason.StartsWith(TemporaryDecisionBlockReasonPrefix, StringComparison.OrdinalIgnoreCase);
         }
 
         // =============================
