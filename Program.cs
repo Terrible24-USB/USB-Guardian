@@ -490,17 +490,6 @@ namespace USBGuardian
                     return;
                 }
 
-                if (evalResult.OverallThreatLevel == ThreatLevel.Critical)
-                {
-                    Debug.WriteLine($"🚨 CRITICAL THREAT DETECTED - Auto-blocking device: {evalResult.BlockReason}");
-                    guardianCore.HandleThreat(currentDevice, evalResult);
-                    historyManager.LogEvent(currentDevice, DeviceEventType.Blocked, evalResult.BlockReason);
-                    ShowBalloonTip(
-                        "🚨 Critical Threat Blocked",
-                        evalResult.BlockReason);
-                    return;
-                }
-
                 Debug.WriteLine("⚠️ DEVICE DECISION REQUIRED - Showing allow/block dialog");
                 bool userAllowed = ShowDeviceDecisionDialog(currentDevice, evalResult, history);
 
