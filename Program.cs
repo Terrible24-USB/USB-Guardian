@@ -97,6 +97,7 @@ namespace USBGuardian
         private const int AllowRecoveryRetryAttempts = 3;
         private const int DecisionPromptDebounceMs  = 1500;
         private const int DecisionDialogTimeoutSeconds = 20;
+        private const int BalloonTipDurationMs = 5000;
         private const string TemporaryDecisionBlockReasonPrefix = "[TEMP_DECISION_PENDING]";
 
         private static readonly Guid GUID_DEVINTERFACE_USB_DEVICE =
@@ -415,6 +416,7 @@ namespace USBGuardian
                 // read/write + cfgmgr32 rescan.  The block is reversed automatically if the
                 // full fingerprint later confirms the device is whitelisted.
                 bool earlyBlockApplied = !string.IsNullOrWhiteSpace(instanceId)
+                    && IsStorageServiceInstance(vid, pid, instanceId)
                     && EarlyBlockUsbInstanceKey(vid, pid, instanceId);
                 if (earlyBlockApplied)
                     LogDecisionPipeline("TEMP_BLOCK_APPLIED", decisionKey, null, "Applied early ConfigFlags quarantine");
@@ -658,7 +660,8 @@ namespace USBGuardian
 
             try
             {
-                if (Thread.CurrentThread.ManagedThreadId == _uiThreadId)
+                if (SynchronizationContext.Current == _uiContext ||
+                    Thread.CurrentThread.ManagedThreadId == _uiThreadId)
                     return DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds);
 
                 DeviceDecisionResult decision = new() { Action = DeviceDecisionAction.Block };
@@ -1211,6 +1214,26 @@ namespace USBGuardian
         /// Returns true if the early block was applied so the caller can reverse it
         /// when the full fingerprint confirms the device is whitelisted.
         /// </summary>
+        private static bool IsStorageServiceInstance(string vid, string pid, string instanceId)
+        {
+            try
+            {
+                string regPath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{vid}&PID_{pid}\{instanceId}";
+                using RegistryKey key = Registry.LocalMachine.OpenSubKey(regPath);
+                if (key == null)
+                    return false;
+
+                string serviceName = key.GetValue("Service")?.ToString();
+                return string.Equals(serviceName, "usbstor", StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(serviceName, "disk", StringComparison.OrdinalIgnoreCase);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[EarlyBlock] Could not determine storage service for {vid}:{pid}:{instanceId}: {ex.Message}");
+                return false;
+            }
+        }
+
         private bool EarlyBlockUsbInstanceKey(string vid, string pid, string instanceId)
         {
             try
@@ -1413,7 +1436,7 @@ namespace USBGuardian
                     trayIcon.BalloonTipTitle = title;
                     trayIcon.BalloonTipText = text;
                     trayIcon.BalloonTipIcon = ToolTipIcon.Info;
-                    trayIcon.ShowBalloonTip(5000);
+                    trayIcon.ShowBalloonTip(BalloonTipDurationMs);
                     return;
                 }
 
@@ -1421,7 +1444,7 @@ namespace USBGuardian
                 {
                     notifyIcon.Icon = SystemIcons.Information;
                     notifyIcon.Visible = true;
-                    notifyIcon.ShowBalloonTip(5000, title, text, ToolTipIcon.Info);
+                    notifyIcon.ShowBalloonTip(BalloonTipDurationMs, title, text, ToolTipIcon.Info);
                 }
             }
             catch (Exception ex)
@@ -1435,7 +1458,7 @@ namespace USBGuardian
             ShowBalloonTip(title, text);
             try
             {
-                _uiContext.Post(_ =>
+                _ = Task.Run(() =>
                 {
                     try
                     {
@@ -1451,7 +1474,7 @@ namespace USBGuardian
                     {
                         Debug.WriteLine($"[Notification] Fail-closed message box failed: {ex.Message}");
                     }
-                }, null);
+                });
             }
             catch (Exception ex)
             {
@@ -1775,8 +1798,7 @@ namespace USBGuardian
 
         private static bool IsTemporaryDecisionBlockRecord(BlockedDeviceRecord record)
         {
-            return record != null &&
-                   !string.IsNullOrWhiteSpace(record.BlockReason) &&
+            return !string.IsNullOrWhiteSpace(record.BlockReason) &&
                    record.BlockReason.StartsWith(TemporaryDecisionBlockReasonPrefix, StringComparison.OrdinalIgnoreCase);
         }
 
