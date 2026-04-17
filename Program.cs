@@ -92,6 +92,7 @@ namespace USBGuardian
         // re-assert ConfigFlags in case Windows re-enables the device node.
         private const int RaceWindowFirstRecheckMs  = 250;
         private const int RaceWindowSecondRecheckMs = 750;
+        private const int DeviceRecoveryTimeoutMs   = 2000;
 
         private static readonly Guid GUID_DEVINTERFACE_USB_DEVICE =
             new Guid("A5DCBF10-6530-11D2-901F-00C04FB951ED");
@@ -414,7 +415,7 @@ namespace USBGuardian
                 Debug.WriteLine($"Captured {currentDevice.IdentifierCount} identifiers for this device");
 
                 // Log insertion event and retrieve history
-                DeviceHistoryRecord history = historyManager.LogEvent(currentDevice, DeviceEventType.Insertion);
+                historyManager.LogEvent(currentDevice, DeviceEventType.Insertion);
 
                 // =============================================
                 // REDESIGNED SECURITY ENGINE EVALUATION
@@ -491,21 +492,37 @@ namespace USBGuardian
                 }
 
                 Debug.WriteLine("⚠️ DEVICE DECISION REQUIRED - Showing allow/block dialog");
-                bool userAllowed = ShowDeviceDecisionDialog(currentDevice, evalResult, history);
+                DeviceDecisionAction userDecision = ShowDeviceDecisionDialog(currentDevice, evalResult);
 
-                if (userAllowed)
+                if (userDecision == DeviceDecisionAction.AllowOnce ||
+                    userDecision == DeviceDecisionAction.AllowAndWhitelist)
                 {
-                    whitelist.Add(currentDevice);
-                    SaveWhitelist();
-                    guardianCore.ApproveWhitelist(currentDevice);
+                    if (userDecision == DeviceDecisionAction.AllowAndWhitelist)
+                    {
+                        whitelist.Add(currentDevice);
+                        SaveWhitelist();
+                        guardianCore.ApproveWhitelist(currentDevice);
+                    }
+
+                    UnblockResult recoveryResult = guardianCore.RecoverAllowedDevice(currentDevice, unblockManager, DeviceRecoveryTimeoutMs);
+                    foreach (string msg in recoveryResult.Messages)
+                        Debug.WriteLine($"[AllowRecovery] {msg}");
 
                     if (UsbStorageBlocker.IsUsbStorageDevice(currentDevice))
                         guardianCore.TemporarilyEnableUsbStorage(currentDevice, 60);
 
-                    historyManager.LogEvent(currentDevice, DeviceEventType.Whitelisted, "User allowed and whitelisted device");
-                    ShowBalloonTip(
-                        "✅ Device Allowed",
-                        $"{currentDevice.Description ?? "Unknown Device"} whitelisted");
+                    string allowReason = userDecision == DeviceDecisionAction.AllowAndWhitelist
+                        ? "User allowed and whitelisted device"
+                        : "User allowed device once";
+                    historyManager.LogEvent(currentDevice, DeviceEventType.Whitelisted, allowReason);
+
+                    string allowTitle = userDecision == DeviceDecisionAction.AllowAndWhitelist
+                        ? "✅ Device Allowed & Whitelisted"
+                        : "✅ Device Allowed Once";
+                    string allowText = recoveryResult.NeedsReplug
+                        ? $"{currentDevice.Description ?? "Unknown Device"} allowed, but Windows may still require unplug/replug."
+                        : $"{currentDevice.Description ?? "Unknown Device"} allowed and re-enumeration completed.";
+                    ShowBalloonTip(allowTitle, allowText);
                     return;
                 }
 
@@ -530,57 +547,40 @@ namespace USBGuardian
             }
         }
 
-        private bool ShowDeviceDecisionDialog(
+        private DeviceDecisionAction ShowDeviceDecisionDialog(
             DeviceFingerprint device,
-            DeviceEvaluationResult evaluationResult,
-            DeviceHistoryRecord historyRecord)
+            DeviceEvaluationResult evaluationResult)
         {
-            string firstSeen = historyRecord?.FirstObservedTime ?? "Unknown";
-            int totalObservations = historyRecord?.TotalObservations ?? 0;
             string threatReason = string.IsNullOrWhiteSpace(evaluationResult.BlockReason)
                 ? "Unrecognized USB device"
                 : evaluationResult.BlockReason;
-
-            string summary =
-                "Device Information:\n" +
-                $"• Manufacturer: {device.Manufacturer ?? "Unknown"}\n" +
-                $"• Product: {device.Description ?? "Unknown Device"}\n" +
-                $"• VID:PID: {device.Vid}:{device.Pid}\n" +
-                $"• Serial: {device.SerialNumber ?? "Not Available"}\n\n" +
-                $"Security Assessment: {evaluationResult.OverallThreatLevel}\n" +
-                $"• Reason: {threatReason}\n" +
-                $"• First seen: {firstSeen}\n" +
-                $"• Total observations: {totalObservations}\n\n" +
-                "This device will be blocked unless you allow and whitelist it.\n" +
-                "Only this device is affected.\n\n" +
-                "Yes = Allow & Whitelist\n" +
-                "No = Block\n" +
-                "Cancel = More Info";
-
-            while (true)
+            var info = new DeviceInformationSnapshot
             {
-                DialogResult result = MessageBox.Show(
-                    summary,
-                    "🔌 USB DEVICE DECISION REQUIRED",
-                    MessageBoxButtons.YesNoCancel,
-                    MessageBoxIcon.Warning,
-                    MessageBoxDefaultButton.Button2);
+                VidPid = $"{device.Vid}:{device.Pid}",
+                SerialNumber = string.IsNullOrWhiteSpace(device.SerialNumber) ? null : device.SerialNumber,
+                Manufacturer = string.IsNullOrWhiteSpace(device.Manufacturer) ? "Unknown" : device.Manufacturer,
+                ProductName = string.IsNullOrWhiteSpace(device.Description) ? "Unknown Device" : device.Description,
+                DeviceClass = string.IsNullOrWhiteSpace(device.DeviceClass) ? "Unknown" : device.DeviceClass,
+                DeviceSubClass = device.UsbDeviceSubClass,
+                InterfaceCount = device.InterfaceCount > 0 ? device.InterfaceCount : device.NumInterfaces,
+                DescriptorHash = string.IsNullOrWhiteSpace(device.DescriptorHash) ? "N/A" : device.DescriptorHash,
+                InsertionTimestampUtc = device.CaptureTime != DateTime.MinValue
+                    ? device.CaptureTime.ToUniversalTime()
+                    : DateTime.UtcNow,
+                PortInformation = string.IsNullOrWhiteSpace(device.LocationInfo) ? "Unavailable" : device.LocationInfo
+            };
 
-                if (result == DialogResult.Yes)
-                    return true;
+            var request = new DeviceDecisionRequest
+            {
+                DeviceInformation = info,
+                ThreatLevel = evaluationResult.OverallThreatLevel,
+                RiskAssessment = threatReason,
+                SuggestedAction =
+                    "Choose Allow Once to permit this insertion only, Allow & Whitelist to trust permanently, or Block to deny access."
+            };
 
-                if (result == DialogResult.No)
-                    return false;
-
-                MessageBox.Show(
-                    GetDeviceDetailsText(device) +
-                    "\n\nThreat Details:\n" +
-                    $"Threat Level: {evaluationResult.OverallThreatLevel}\n" +
-                    $"Reason: {threatReason}",
-                    "USB Guardian - Device Details",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-            }
+            DeviceDecisionResult decision = DeviceDecisionDialog.ShowDecision(request);
+            return decision.Action;
         }
 
         private void HandleUnknownDevice(DeviceFingerprint device, DeviceEvaluationResult? evaluationResult = null)

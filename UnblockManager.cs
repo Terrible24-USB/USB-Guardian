@@ -40,6 +40,9 @@ namespace USBGuardian
         // ConfigFlags bits added by USB Guardian at block time
         private const int ConfigFlagDisabled  = 0x100;
         private const int ConfigFlagReinstall = 0x40;
+        private const int ServiceStartDisabled = 4;
+        private const int ServiceStartDemand = 3;
+        private const int MinPollIntervalMs = 50;
 
         // Timing constants for post-unblock device verification
         // ConfigFlags changes need a brief delay before Windows processes them.
@@ -83,6 +86,13 @@ namespace USBGuardian
         /// After successful completion the record is removed from the store.
         /// </summary>
         public UnblockResult UnblockDevice(BlockedDeviceRecord record)
+            => UnblockDevice(record, removeFromStore: true);
+
+        /// <summary>
+        /// Reverse all block actions recorded for <paramref name="record"/>.
+        /// Optionally keeps the record out of store-removal flow for temporary allow recovery.
+        /// </summary>
+        public UnblockResult UnblockDevice(BlockedDeviceRecord record, bool removeFromStore)
         {
             var result = new UnblockResult();
             if (record == null) return result;
@@ -175,8 +185,104 @@ namespace USBGuardian
             }
 
             // Remove from the store so it no longer appears in the unblock list
-            if (!DryRun)
+            if (!DryRun && removeFromStore)
                 _store.Remove(record);
+
+            return result;
+        }
+
+        /// <summary>
+        /// Best-effort allow/recovery path for a device currently being evaluated.
+        /// Handles both pre-block (no-op reversals) and mid-block states by preparing
+        /// temporary rollback actions from current registry/WMI state.
+        /// </summary>
+        public UnblockResult RecoverEvaluatingDevice(
+            DeviceFingerprint device,
+            int waitTimeoutMs = 2000,
+            int pollIntervalMs = 200)
+        {
+            var result = new UnblockResult();
+            if (device == null)
+            {
+                result.Messages.Add("Recovery skipped: device fingerprint is null.");
+                return result;
+            }
+
+            string vid = device.Vid ?? string.Empty;
+            string pid = device.Pid ?? string.Empty;
+            string instanceId = device.InstanceId ?? string.Empty;
+            string vidPid = $"{vid}:{pid}";
+
+            _logger.LogInfo(0, "AllowRecovery",
+                $"Preparing temporary allow recovery for {vidPid} ({device.Description ?? "Unknown Device"})",
+                vidPid);
+
+            var actions = new List<BlockActionRecord>();
+
+            if (!string.IsNullOrWhiteSpace(vid) &&
+                !string.IsNullOrWhiteSpace(pid) &&
+                !string.IsNullOrWhiteSpace(instanceId))
+            {
+                string usbPath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{vid}&PID_{pid}\{instanceId}";
+                int? usbConfig = TryReadRegistryDword(usbPath, "ConfigFlags");
+                actions.Add(new BlockActionRecord
+                {
+                    ActionType = "ConfigFlags",
+                    RegistryPath = usbPath,
+                    PreviousConfigFlags = (usbConfig ?? 0) & ~(ConfigFlagDisabled | ConfigFlagReinstall)
+                });
+            }
+
+            if (!string.IsNullOrWhiteSpace(device.DeviceId) &&
+                device.DeviceId.StartsWith("USBSTOR", StringComparison.OrdinalIgnoreCase))
+            {
+                string usbStorPath = $@"SYSTEM\CurrentControlSet\Enum\{device.DeviceId.Replace('/', '\\')}";
+                int? storConfig = TryReadRegistryDword(usbStorPath, "ConfigFlags");
+                actions.Add(new BlockActionRecord
+                {
+                    ActionType = "ConfigFlags",
+                    RegistryPath = usbStorPath,
+                    PreviousConfigFlags = (storConfig ?? 0) & ~(ConfigFlagDisabled | ConfigFlagReinstall)
+                });
+            }
+
+            int? usbStorStart = TryReadRegistryDword(@"SYSTEM\CurrentControlSet\Services\usbstor", "Start");
+            actions.Add(new BlockActionRecord
+            {
+                ActionType = "ServiceStart",
+                ServiceName = "usbstor",
+                PreviousServiceStart = usbStorStart.HasValue && usbStorStart.Value != ServiceStartDisabled
+                    ? usbStorStart.Value
+                    : ServiceStartDemand
+            });
+
+            actions.Add(new BlockActionRecord { ActionType = "WmiDisable" });
+
+            var tempRecord = new BlockedDeviceRecord
+            {
+                Vid = vid,
+                Pid = pid,
+                InstanceId = instanceId,
+                SerialNumber = device.SerialNumber ?? string.Empty,
+                Description = device.Description ?? string.Empty,
+                PnpDeviceId = device.DeviceId ?? string.Empty,
+                BlockReason = "Temporary allow recovery",
+                Actions = actions
+            };
+
+            result = UnblockDevice(tempRecord, removeFromStore: false);
+            result.Messages.Add("Temporary allow recovery actions executed.");
+
+            bool detected = WaitForDeviceReady(tempRecord, waitTimeoutMs, pollIntervalMs);
+            if (detected)
+            {
+                result.NeedsReplug = false;
+                result.Messages.Add($"Device detected in WMI within timeout ({waitTimeoutMs} ms).");
+            }
+            else
+            {
+                result.Messages.Add($"Device not detected in WMI within timeout ({waitTimeoutMs} ms).");
+            }
 
             return result;
         }
@@ -686,6 +792,39 @@ namespace USBGuardian
                 Debug.WriteLine($"[UnblockManager] ReEnumerateNode error for '{deviceInstanceId}': {ex.Message}");
                 return false;
             }
+        }
+
+        private static int? TryReadRegistryDword(string registryPath, string valueName)
+        {
+            try
+            {
+                using var key = Registry.LocalMachine.OpenSubKey(registryPath, writable: false);
+                return key?.GetValue(valueName) is int value ? value : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool WaitForDeviceReady(
+            BlockedDeviceRecord record,
+            int waitTimeoutMs,
+            int pollIntervalMs)
+        {
+            if (waitTimeoutMs <= 0)
+                return IsDeviceReadyViaWmi(record);
+
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < waitTimeoutMs)
+            {
+                if (IsDeviceReadyViaWmi(record))
+                    return true;
+
+                System.Threading.Thread.Sleep(Math.Max(MinPollIntervalMs, pollIntervalMs));
+            }
+
+            return IsDeviceReadyViaWmi(record);
         }
 
         private static string WmiEscape(string value)
