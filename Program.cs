@@ -161,10 +161,6 @@ namespace USBGuardian
                 dryRun: unblockManager.DryRun);
 
             _inputContainment = new InputContainmentManager(guardianCore.EventLogger);
-<<<<<<< HEAD
-
-=======
->>>>>>> 0bdff85604eb2bf74cbcd4946b8780b243565723
             try
             {
                 _inputContainment.InitializeHooks();
@@ -174,12 +170,6 @@ namespace USBGuardian
                 Debug.WriteLine($"[Startup] Input containment hook install failed: {ex.Message}");
                 guardianCore?.EventLogger?.LogWarning(0, "SinkMode", $"Hook install failed at startup: {ex.Message}");
             }
-<<<<<<< HEAD
-
-            _inputContainment.InitializeHooks();
-
-=======
->>>>>>> 0bdff85604eb2bf74cbcd4946b8780b243565723
             Application.ApplicationExit += (_, _) => _inputContainment.Dispose();
 
             // Set up system tray icon with context menu
@@ -571,14 +561,10 @@ namespace USBGuardian
                 }
 
                 DeviceDecisionResult decisionResult;
-<<<<<<< HEAD
 
                 var containmentScope = new InputContainmentManager.ContainmentScope(_inputContainment, $"Decision prompt for {decisionKey}");
                 _inputContainment.Activate($"Decision prompt for {decisionKey}");
 
-=======
-                using var containmentScope = _inputContainment.BeginContainment($"Decision prompt for {decisionKey}");
->>>>>>> 0bdff85604eb2bf74cbcd4946b8780b243565723
                 try
                 {
                     LogDecisionPipeline("PROMPT_SHOWN", decisionKey, currentDevice,
