@@ -247,24 +247,6 @@ namespace USBGuardian
         }
 
 
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct POINT
-        {
-            public int x;
-            public int y;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct MSLLHOOKSTRUCT
-        {
-            public POINT pt;
-            public uint mouseData;
-            public uint flags;
-            public uint time;
-            public IntPtr dwExtraInfo;
-        }
-
         [StructLayout(LayoutKind.Sequential)]
         private struct INPUT
         {
@@ -312,12 +294,5 @@ namespace USBGuardian
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr WindowFromPoint(POINT pt);
-
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
     }
 }
