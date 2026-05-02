@@ -86,16 +86,16 @@ namespace USBGuardian
 
         // ConfigFlags bits used when blocking a device per-instance
         // (same semantics as UsbStorageBlocker / UsbBlockingManager constants)
-        private const int ConfigFlagDisabled  = 0x100;  // CONFIGFLAG_DISABLED
+        private const int ConfigFlagDisabled = 0x100;  // CONFIGFLAG_DISABLED
         private const int ConfigFlagReinstall = 0x40;   // CONFIGFLAG_REINSTALL
 
         // Race-window re-check delays (ms) applied after an immediate block to
         // re-assert ConfigFlags in case Windows re-enables the device node.
-        private const int RaceWindowFirstRecheckMs  = 250;
+        private const int RaceWindowFirstRecheckMs = 250;
         private const int RaceWindowSecondRecheckMs = 750;
-        private const int DeviceRecoveryTimeoutMs   = 2000;
+        private const int DeviceRecoveryTimeoutMs = 2000;
         private const int AllowRecoveryRetryAttempts = 3;
-        private const int DecisionPromptDebounceMs  = 1500;
+        private const int DecisionPromptDebounceMs = 1500;
         private const int DecisionDialogTimeoutSeconds = 20;
         private const int BalloonTipDurationMs = 5000;
         private const string TemporaryDecisionBlockReasonPrefix = "[TEMP_DECISION_PENDING]";
@@ -120,6 +120,7 @@ namespace USBGuardian
         private readonly Dictionary<string, DateTime> _lastDecisionPromptUtc = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, BlockedDeviceRecord> _temporaryDecisionBlocks = new(StringComparer.OrdinalIgnoreCase);
         private readonly InputContainmentManager _inputContainment;
+        private readonly PnpDeviceGuard _pnpGuard;
 
         public USBMessageWindow()
         {
@@ -171,6 +172,21 @@ namespace USBGuardian
                 guardianCore?.EventLogger?.LogWarning(0, "SinkMode", $"Hook install failed at startup: {ex.Message}");
             }
             Application.ApplicationExit += (_, _) => _inputContainment.Dispose();
+
+            // PnP fast-path: fires ~10-30ms after insertion, before HID stack completes.
+            // Used to immediately freeze unknown devices via CM_Disable_DevNode.
+            _pnpGuard = new PnpDeviceGuard();
+            _pnpGuard.DeviceArrived += OnPnpDeviceArrived;
+            try
+            {
+                _pnpGuard.Register();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Startup] PnpDeviceGuard registration failed: {ex.Message}");
+                guardianCore?.EventLogger?.LogWarning(0, "PnpGuard", $"PnP registration failed: {ex.Message}");
+            }
+            Application.ApplicationExit += (_, _) => _pnpGuard.Dispose();
 
             // Set up system tray icon with context menu
             SetupTrayIcon();
@@ -378,6 +394,61 @@ namespace USBGuardian
 
             base.WndProc(ref m);
         }
+        // Tracks device instance IDs frozen by the PnP fast-path so ProcessUsbDevice
+        // knows whether CM_Disable was already applied.
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool>
+            _pnpFrozenInstances = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Called by PnpDeviceGuard ~10-30ms after USB insertion, before the HID
+        /// driver finishes loading.  We immediately disable the device node so that
+        /// a Rubber Ducky cannot send a single keystroke.  The WM_DEVICECHANGE /
+        /// WndProc path still runs afterwards to handle the full decision flow.
+        /// </summary>
+        private void OnPnpDeviceArrived(string symbolicLink)
+        {
+            try
+            {
+                // Derive the device instance ID from the symbolic link.
+                // Symbolic link format: \\?\USB#VID_xxxx&PID_xxxx#instanceId#{guid}
+                // We need: USB\VID_xxxx&PID_xxxx\instanceId
+                string instanceId = SymbolicLinkToInstanceId(symbolicLink);
+                if (string.IsNullOrWhiteSpace(instanceId)) return;
+
+                // Only freeze HID-class or unknown devices — storage devices are
+                // handled by the existing EarlyBlockUsbInstanceKey path.
+                // We freeze everything here and let ProcessUsbDevice sort it out.
+                bool frozen = PnpDeviceGuard.DisableDevNode(instanceId);
+                if (frozen)
+                {
+                    _pnpFrozenInstances[instanceId] = true;
+                    guardianCore?.EventLogger?.LogWarning(0, "PnpGuard",
+                        $"Device frozen at PnP arrival: {instanceId}");
+                    Debug.WriteLine($"[PnpGuard] Frozen: {instanceId}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[PnpGuard] OnPnpDeviceArrived error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Converts a device symbolic link to a PnP instance ID.
+        /// e.g. "\\?\USB#VID_1234&PID_5678#ABC#{guid}" → "USB\VID_1234&PID_5678\ABC"
+        /// </summary>
+        private static string SymbolicLinkToInstanceId(string symLink)
+        {
+            if (string.IsNullOrWhiteSpace(symLink)) return string.Empty;
+            // Strip leading \\?\ or \\.\
+            string s = symLink.TrimStart('\\').TrimStart('?').TrimStart('.').TrimStart('\\');
+            // Remove trailing {guid} segment
+            int brace = s.LastIndexOf('{');
+            if (brace > 0) s = s.Substring(0, brace).TrimEnd('#').TrimEnd('\\');
+            // Replace # with \
+            return s.Replace('#', '\\').Trim('\\');
+        }
+
         private static string SafeGetString(ManagementObject obj, string propertyName)
         {
             try
@@ -447,6 +518,15 @@ namespace USBGuardian
 
             try
             {
+                // PNP FAST-PATH NOTE ───────────────────────────────────────────────────────
+                // OnPnpDeviceArrived may have already called CM_Disable_DevNode on this
+                // device ~10-30ms ago (before the HID driver finished loading).  Track
+                // whether that happened so we can re-enable on Allow.
+                bool pnpAlreadyFrozen = !string.IsNullOrWhiteSpace(instanceId)
+                    && _pnpFrozenInstances.TryRemove(instanceId, out _);
+                if (pnpAlreadyFrozen)
+                    LogDecisionPipeline("PNP_FROZEN", decisionKey, null, "Device was pre-frozen by PnP fast-path");
+
                 // EARLY BLOCK ─────────────────────────────────────────────────────────────
                 // Apply ConfigFlags disable bits on the USB instance key right now, before
                 // the slow fingerprint capture (WMI, SCSI IOCTL, USB hub IOCTLs) runs.
@@ -525,6 +605,13 @@ namespace USBGuardian
                         }
                     }
 
+                    // Re-enable the device node if the PnP fast-path had frozen it.
+                    if (pnpAlreadyFrozen && !string.IsNullOrWhiteSpace(instanceId))
+                    {
+                        PnpDeviceGuard.EnableDevNode(instanceId);
+                        Debug.WriteLine($"[PnpGuard] Re-enabled whitelisted device: {instanceId}");
+                    }
+
                     Debug.WriteLine("✅ DEVICE ALLOWED - Found in whitelist");
                     matchedDevice.LastConnectedTime = DateTime.UtcNow;
                     SaveWhitelist();
@@ -596,6 +683,13 @@ namespace USBGuardian
                 if (userDecision == DeviceDecisionAction.AllowOnce ||
                     userDecision == DeviceDecisionAction.AllowAndWhitelist)
                 {
+                    // Re-enable device node if the PnP fast-path had frozen it.
+                    if (pnpAlreadyFrozen && !string.IsNullOrWhiteSpace(instanceId))
+                    {
+                        PnpDeviceGuard.EnableDevNode(instanceId);
+                        Debug.WriteLine($"[PnpGuard] Re-enabled allowed device: {instanceId}");
+                    }
+
                     if (temporaryDecisionBlock != null)
                     {
                         UnblockResult tempUnblockResult = unblockManager.UnblockDevice(temporaryDecisionBlock);
@@ -1059,7 +1153,7 @@ namespace USBGuardian
                         {
                             using var searcher = new System.Management.ManagementObjectSearcher(wmiQuery);
                             wmiResults = searcher.Get();
-                            foreach (System.Management.ManagementObject obj in wmiResults)
+                            foreach (System.Management.ManagementObject obj in wmiResults.Cast<System.Management.ManagementObject>())
                             {
                                 if (obj == null) continue;
                                 string devId;
@@ -1227,7 +1321,7 @@ namespace USBGuardian
             // Exact match on USB\VID_...\InstanceId
             if (!string.IsNullOrEmpty(device.InstanceId) && device.InstanceId != "Unknown")
             {
-                string usbPath       = $@"USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
+                string usbPath = $@"USB\VID_{device.Vid}&PID_{device.Pid}\{device.InstanceId}";
                 string escapedUsbPath = usbPath.Replace("\\", "\\\\").Replace("'", "\\'");
                 queries.Add($"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{escapedUsbPath}'");
             }
@@ -1244,7 +1338,7 @@ namespace USBGuardian
                 {
                     using var searcher = new ManagementObjectSearcher(wql);
                     results = searcher.Get();
-                    foreach (ManagementObject obj in results)
+                    foreach (ManagementObject obj in results.Cast<ManagementObject>())
                     {
                         if (obj == null) continue;
 
@@ -1375,7 +1469,7 @@ namespace USBGuardian
 
                 bool isStorage =
                     string.Equals(serviceName, "usbstor", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(serviceName, "disk",    StringComparison.OrdinalIgnoreCase);
+                    string.Equals(serviceName, "disk", StringComparison.OrdinalIgnoreCase);
 
                 if (!isStorage)
                     return false;
@@ -1443,7 +1537,7 @@ namespace USBGuardian
             bool temporaryForDecision = false,
             string? decisionKey = null)
         {
-            string vidPid    = $"{device.Vid}:{device.Pid}";
+            string vidPid = $"{device.Vid}:{device.Pid}";
             string timestamp = DateTime.UtcNow.ToString("o");
 
             guardianCore.EventLogger.LogCritical(0, "WhitelistEnforcement",
@@ -1494,13 +1588,13 @@ namespace USBGuardian
 
             var record = new BlockedDeviceRecord
             {
-                Vid          = device.Vid          ?? string.Empty,
-                Pid          = device.Pid          ?? string.Empty,
-                InstanceId   = device.InstanceId   ?? string.Empty,
+                Vid = device.Vid ?? string.Empty,
+                Pid = device.Pid ?? string.Empty,
+                InstanceId = device.InstanceId ?? string.Empty,
                 SerialNumber = device.SerialNumber ?? string.Empty,
-                Description  = device.Description  ?? string.Empty,
-                PnpDeviceId  = device.DeviceId     ?? string.Empty,
-                BlockReason  = reason,
+                Description = device.Description ?? string.Empty,
+                PnpDeviceId = device.DeviceId ?? string.Empty,
+                BlockReason = reason,
                 Actions = actions
             };
             blockedDeviceStore.AddOrUpdate(record);
@@ -1974,9 +2068,9 @@ namespace USBGuardian
         [DllImport("cfgmgr32.dll")]
         private static extern int CM_Reenumerate_DevNode(uint dnDevInst, uint ulFlags);
 
-        private const int  CM_CR_SUCCESS               = 0;
+        private const int CM_CR_SUCCESS = 0;
         private const uint CM_LOCATE_DEVNODE_NORMAL_WL = 0;
-        private const uint CM_REENUMERATE_NORMAL_WL    = 0;
+        private const uint CM_REENUMERATE_NORMAL_WL = 0;
 
 
         public class DeviceIdentifier
@@ -1999,7 +2093,7 @@ namespace USBGuardian
                         using var searcher = new ManagementObjectSearcher(
                             "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
                         diskResults = searcher.Get();
-                        foreach (ManagementObject disk in diskResults)
+                        foreach (ManagementObject disk in diskResults.Cast<ManagementObject>())
                         {
                             string pnpDeviceId = SafeGetString(disk, "PNPDeviceID");
                             if (!string.IsNullOrEmpty(pnpDeviceId) && pnpDeviceId.Contains($"VID_{vid}&PID_{pid}"))
@@ -2024,7 +2118,7 @@ namespace USBGuardian
                         using var partitionSearcher = new ManagementObjectSearcher(
                             $"ASSOCIATORS OF {{Win32_DiskDrive.DeviceID='{physicalDrive}'}} WHERE AssocClass=Win32_DiskDriveToDiskPartition");
                         partResults = partitionSearcher.Get();
-                        foreach (ManagementObject partition in partResults)
+                        foreach (ManagementObject partition in partResults.Cast<ManagementObject>())
                         {
                             string partitionDeviceId = SafeGetString(partition, "DeviceID");
                             if (string.IsNullOrEmpty(partitionDeviceId))
@@ -2037,7 +2131,7 @@ namespace USBGuardian
                                 using var logicalSearcher = new ManagementObjectSearcher(
                                     $"ASSOCIATORS OF {{Win32_DiskPartition.DeviceID='{partitionDeviceId}'}} WHERE AssocClass=Win32_LogicalDiskToPartition");
                                 logicalResults = logicalSearcher.Get();
-                                foreach (ManagementObject logical in logicalResults)
+                                foreach (ManagementObject logical in logicalResults.Cast<ManagementObject>())
                                 {
                                     string volumeSerial = SafeGetString(logical, "VolumeSerialNumber");
                                     if (!string.IsNullOrEmpty(volumeSerial))
@@ -2070,7 +2164,7 @@ namespace USBGuardian
                     using var searcher = new ManagementObjectSearcher(
                         "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
                     results = searcher.Get();
-                    foreach (ManagementObject disk in results)
+                    foreach (ManagementObject disk in results.Cast<ManagementObject>())
                     {
                         string pnpDeviceId = SafeGetString(disk, "PNPDeviceID");
                         Debug.WriteLine($"[GetPhysicalDrivePath] Checking disk: {pnpDeviceId}");
@@ -2167,8 +2261,8 @@ namespace USBGuardian
                 // Determine high‑level device class (string)
                 fingerprint.DeviceClass = DetermineDeviceClass(fingerprint.Service, fingerprint.HardwareIds);
 
-                
-                
+
+
 
                 // Get compatible IDs
                 fingerprint.CompatibleIds = GetCompatibleIds(vid, pid, instanceId);
@@ -2268,9 +2362,9 @@ namespace USBGuardian
                 string product;
                 string revision;
 
-              
 
-                
+
+
 
 
 
@@ -2280,7 +2374,7 @@ namespace USBGuardian
 
                 return fingerprint;
             }
-            
+
 
 
             private string GenerateFallbackDescriptorHash(DeviceFingerprint f)
@@ -2306,11 +2400,11 @@ namespace USBGuardian
                     {
                         if (key != null)
                         {
-                            fingerprint.FriendlyName  = key.GetValue("FriendlyName")?.ToString();
-                            fingerprint.ClassGuid      = key.GetValue("ClassGUID")?.ToString();
-                            fingerprint.DriverKeyName  = key.GetValue("Driver")?.ToString();
-                            fingerprint.LocationInfo   = key.GetValue("LocationInformation")?.ToString();
-                            fingerprint.Enumerator     = key.GetValue("EnumeratorName")?.ToString();
+                            fingerprint.FriendlyName = key.GetValue("FriendlyName")?.ToString();
+                            fingerprint.ClassGuid = key.GetValue("ClassGUID")?.ToString();
+                            fingerprint.DriverKeyName = key.GetValue("Driver")?.ToString();
+                            fingerprint.LocationInfo = key.GetValue("LocationInformation")?.ToString();
+                            fingerprint.Enumerator = key.GetValue("EnumeratorName")?.ToString();
 
                             object addrObj = key.GetValue("Address");
                             if (addrObj != null)
@@ -2334,9 +2428,9 @@ namespace USBGuardian
                         {
                             if (driverKey != null)
                             {
-                                fingerprint.DriverName    = driverKey.GetValue("DriverDesc")?.ToString();
+                                fingerprint.DriverName = driverKey.GetValue("DriverDesc")?.ToString();
                                 fingerprint.DriverVersion = driverKey.GetValue("DriverVersion")?.ToString();
-                                fingerprint.DriverDate    = driverKey.GetValue("DriverDate")?.ToString();
+                                fingerprint.DriverDate = driverKey.GetValue("DriverDate")?.ToString();
 
                                 string infPath = driverKey.GetValue("InfPath")?.ToString();
                                 if (!string.IsNullOrEmpty(infPath) && string.IsNullOrEmpty(fingerprint.KernelName))
@@ -2356,7 +2450,7 @@ namespace USBGuardian
                             using var searcher = new ManagementObjectSearcher(
                                 "SELECT * FROM Win32_DiskDrive WHERE InterfaceType='USB'");
                             diskResults = searcher.Get();
-                            foreach (ManagementObject disk in diskResults)
+                            foreach (ManagementObject disk in diskResults.Cast<ManagementObject>())
                             {
                                 string pnpDeviceId = SafeGetString(disk, "PNPDeviceID");
                                 if (!string.IsNullOrEmpty(pnpDeviceId) &&
@@ -2580,9 +2674,9 @@ namespace USBGuardian
                         Console.WriteLine($"║   USB SubClass:....... 0x{fingerprint.UsbDeviceSubClass:X2}                                       ║");
                         Console.WriteLine($"║   USB Protocol:....... 0x{fingerprint.UsbDeviceProtocol:X2}                                       ║");
 
-                        string ifClassName  = HIDClassifier.GetClassName(fingerprint.InterfaceClass);
-                        string ifSubCls     = HIDClassifier.GetSubClassName(fingerprint.InterfaceClass, fingerprint.InterfaceSubClass);
-                        string ifProto      = HIDClassifier.GetProtocolName(fingerprint.InterfaceClass, fingerprint.InterfaceSubClass, fingerprint.InterfaceProtocol);
+                        string ifClassName = HIDClassifier.GetClassName(fingerprint.InterfaceClass);
+                        string ifSubCls = HIDClassifier.GetSubClassName(fingerprint.InterfaceClass, fingerprint.InterfaceSubClass);
+                        string ifProto = HIDClassifier.GetProtocolName(fingerprint.InterfaceClass, fingerprint.InterfaceSubClass, fingerprint.InterfaceProtocol);
                         Console.WriteLine($"║   Interface Class:.... 0x{fingerprint.InterfaceClass:X2} ({PadRight(ifClassName, 30)}) ║");
                         Console.WriteLine($"║   Interface SubClass:. 0x{fingerprint.InterfaceSubClass:X2} ({PadRight(ifSubCls, 30)}) ║");
                         Console.WriteLine($"║   Interface Protocol:. 0x{fingerprint.InterfaceProtocol:X2} ({PadRight(ifProto, 30)}) ║");
@@ -2598,7 +2692,7 @@ namespace USBGuardian
                         {
                             0xC0 => "Self Powered",
                             0xE0 => "Self Powered + Remote Wakeup",
-                            _    => "Bus Powered"
+                            _ => "Bus Powered"
                         };
                         Console.WriteLine($"║   Config Attributes:.. 0x{fingerprint.ConfigurationAttributes:X2} ({PadRight(attrDesc, 31)}) ║");
                     }
@@ -2805,9 +2899,9 @@ namespace USBGuardian
 
             private static string FormatStorageSize(long bytes)
             {
-                const long BytesPerGb  = 1_000_000_000L;
+                const long BytesPerGb = 1_000_000_000L;
                 const long BytesPerGib = 1024L * 1024L * 1024L;
-                double gb  = bytes / (double)BytesPerGb;
+                double gb = bytes / (double)BytesPerGb;
                 double gib = bytes / (double)BytesPerGib;
                 return $"{gb:F1} GB / {gib:F1} GiB ({bytes:N0} Bytes)";
             }
@@ -2819,7 +2913,7 @@ namespace USBGuardian
                     "D1" => "D1 (Low Power)",
                     "D2" => "D2 (Low Power)",
                     "D3" => "D3 (Off / Suspended)",
-                    _    => state
+                    _ => state
                 };
 
             private static string DecodeCapabilities(uint caps)
@@ -3168,7 +3262,7 @@ namespace USBGuardian
                 {
                     using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_LogicalDisk WHERE DriveType=2");
                     results = searcher.Get();
-                    foreach (ManagementObject disk in results)
+                    foreach (ManagementObject disk in results.Cast<ManagementObject>())
                     {
                         string volumeSerial = disk["VolumeSerialNumber"]?.ToString();
                         if (!string.IsNullOrEmpty(volumeSerial)) return volumeSerial;
@@ -3333,7 +3427,7 @@ namespace USBGuardian
 
         // Interface count & volume serial
         public int InterfaceCount { get; set; }
-       
+
 
         // Metadata
         public DateTime CaptureTime { get; set; }

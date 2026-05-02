@@ -112,15 +112,6 @@ namespace USBGuardian
                 ForeColor = Color.DimGray
             };
 
-
-            var lblShortcuts = new Label
-            {
-                Text = "Shortcuts: A = Allow Once, W = Allow & Whitelist, B = Block, I = Ignore",
-                Location = new Point(20, 430),
-                Size = new Size(610, 22),
-                ForeColor = Color.DimGray
-            };
-
             form.KeyDown += (_, e) =>
             {
                 if (e.KeyCode == Keys.A)
@@ -150,7 +141,7 @@ namespace USBGuardian
                 txtDetails, chkNeverAsk, btnAllow, btnWhitelist, btnBlock, btnIgnore, lblShortcuts
             });
 
-            using var timeoutTimer = new Timer { Interval = timeoutSeconds * 1000 };
+            using var timeoutTimer = new System.Windows.Forms.Timer { Interval = timeoutSeconds * 1000 };
             timeoutTimer.Tick += (_, _) =>
             {
                 timeoutTimer.Stop();
