@@ -330,8 +330,34 @@ namespace USBGuardian
 
                         if (!string.IsNullOrEmpty(vid) && !string.IsNullOrEmpty(pid))
                         {
+                            // FIX: ProcessUsbDevice was called directly inside WndProc, which runs
+                            // on the UI thread (the Win32 message pump).  Calling ShowDialog from
+                            // inside WndProc deadlocks the dialog — the modal form needs the message
+                            // pump to render and respond to clicks, but the pump is blocked waiting
+                            // for WndProc to return.  Result: dialog freezes/never appears, the
+                            // 20-second timeout fires silently, and the device is always blocked.
+                            //
+                            // Fix: immediately hand off to a ThreadPool thread.  The fingerprint
+                            // capture, security evaluation, and decision dialog all run off-thread.
+                            // ShowDeviceDecisionDialog then correctly uses _uiContext.Send() to
+                            // marshal only the dialog itself back onto the UI thread — at which
+                            // point the message pump is free and the dialog works normally.
                             var timer = Stopwatch.StartNew();
-                            ProcessUsbDevice(vid, pid, instanceId, devicePath, timer);
+                            string capturedVid = vid;
+                            string capturedPid = pid;
+                            string capturedInstanceId = instanceId;
+                            string capturedPath = devicePath;
+                            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+                            {
+                                try
+                                {
+                                    ProcessUsbDevice(capturedVid, capturedPid, capturedInstanceId, capturedPath, timer);
+                                }
+                                catch (Exception ex)
+                                {
+                                    Debug.WriteLine($"[WndProc] ProcessUsbDevice thread error: {ex.Message}");
+                                }
+                            });
                         }
                     }
                 }
@@ -585,6 +611,17 @@ namespace USBGuardian
 
                     if (UsbStorageBlocker.IsUsbStorageDevice(currentDevice))
                         guardianCore.TemporarilyEnableUsbStorage(currentDevice, 60);
+
+                    // FIX: keystroke monitoring was never started for allowed HID devices,
+                    // making Layer 3 RubberDucky detection completely inert.  Start it now
+                    // for any keyboard/mouse that the user has just approved so that
+                    // suspicious typing patterns are detected while the device is active.
+                    if (UsbStorageBlocker.IsHidDevice(currentDevice))
+                    {
+                        string hidVidPid = $"{currentDevice.Vid}:{currentDevice.Pid}";
+                        guardianCore.StartKeystrokeMonitoring(hidVidPid);
+                        Debug.WriteLine($"[KeystrokeMonitor] Started monitoring for allowed HID device {hidVidPid}");
+                    }
 
                     string allowReason = userDecision == DeviceDecisionAction.AllowAndWhitelist
                         ? "User allowed and whitelisted device"
@@ -901,6 +938,7 @@ namespace USBGuardian
             return sb.ToString();
         }
 
+        [System.Diagnostics.DebuggerNonUserCode]
         private void BlockDevice(DeviceFingerprint device)
         {
             try
@@ -991,9 +1029,34 @@ namespace USBGuardian
                             wmiResults = searcher.Get();
                             foreach (System.Management.ManagementObject obj in wmiResults)
                             {
-                                obj.InvokeMethod("Disable", null);
-                                Debug.WriteLine($"Unknown device disabled via WMI: {obj["DeviceID"]}");
-                                actions.Add(new BlockActionRecord { ActionType = "WmiDisable" });
+                                if (obj == null) continue;
+                                string devId;
+                                try { devId = obj["DeviceID"]?.ToString() ?? string.Empty; }
+                                catch { continue; }
+                                if (string.IsNullOrEmpty(devId)) continue;
+
+                                try
+                                {
+                                    obj.InvokeMethod("Disable", null);
+                                    Debug.WriteLine($"Unknown device disabled via WMI: {devId}");
+                                    actions.Add(new BlockActionRecord { ActionType = "WmiDisable" });
+                                }
+                                catch (NullReferenceException)
+                                {
+                                    Debug.WriteLine($"[BlockDevice] WMI Disable skipped for '{devId}': object already null (device node dropped)");
+                                }
+                                catch (InvalidOperationException invalidEx)
+                                {
+                                    Debug.WriteLine($"[BlockDevice] WMI Disable skipped for '{devId}': object no longer valid — {invalidEx.Message}");
+                                }
+                                catch (ManagementException mex)
+                                {
+                                    Debug.WriteLine($"[BlockDevice] WMI Disable failed for '{devId}' (WMI status: {mex.ErrorCode}): {mex.Message}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Debug.WriteLine($"[BlockDevice] WMI Disable failed for '{devId}': {ex.Message}");
+                                }
                                 break;
                             }
                         }
@@ -1110,6 +1173,12 @@ namespace USBGuardian
         /// first (by DeviceId / PnpDeviceId) and falling back to a VID/PID LIKE query.
         /// All matching nodes that have not yet been seen are disabled.
         /// </summary>
+        // [DebuggerNonUserCode] tells Visual Studio not to break on caught exceptions
+        // inside this method even when "Break when this exception type is thrown" is
+        // enabled for NullReferenceException.  The NRE from WMI's internal COM layer
+        // (thrown when a device node is dropped before InvokeMethod runs) is intentionally
+        // caught and handled — it is not a bug.
+        [System.Diagnostics.DebuggerNonUserCode]
         private static void DisableStorageDeviceViaWmi(DeviceFingerprint device,
             List<BlockActionRecord> actions)
         {
@@ -1146,8 +1215,16 @@ namespace USBGuardian
                     foreach (ManagementObject obj in results)
                     {
                         if (obj == null) continue;
-                        string devId = obj["DeviceID"]?.ToString() ?? string.Empty;
-                        if (!seen.Add(devId)) continue;
+
+                        // Re-read DeviceID immediately before invoking to catch objects that
+                        // became stale between enumeration and the method call (the early
+                        // ConfigFlags block + cfgmgr32 rescan may have already dropped the
+                        // device node by the time WMI gets here).
+                        string devId;
+                        try { devId = obj["DeviceID"]?.ToString() ?? string.Empty; }
+                        catch { continue; }
+
+                        if (string.IsNullOrEmpty(devId) || !seen.Add(devId)) continue;
 
                         try
                         {
@@ -1155,9 +1232,25 @@ namespace USBGuardian
                             actions.Add(new BlockActionRecord { ActionType = "WmiDisable" });
                             Debug.WriteLine($"[WhitelistEnforcement] WMI disabled: {devId}");
                         }
+                        catch (NullReferenceException)
+                        {
+                            // Object became null after enumeration — device node already gone, skip.
+                            Debug.WriteLine($"[WhitelistEnforcement] WMI Disable skipped for '{devId}': object already null (device node dropped by early block)");
+                        }
+                        catch (InvalidOperationException invalidEx)
+                        {
+                            Debug.WriteLine($"[WhitelistEnforcement] WMI Disable skipped for '{devId}': object no longer valid — {invalidEx.Message}");
+                        }
+                        catch (ManagementException mex) when (
+                            mex.ErrorCode == ManagementStatus.NotFound ||
+                            mex.ErrorCode == ManagementStatus.InvalidObject ||
+                            mex.ErrorCode == ManagementStatus.InvalidQuery)
+                        {
+                            Debug.WriteLine($"[WhitelistEnforcement] WMI Disable skipped for '{devId}': device no longer available (WMI status: {mex.ErrorCode})");
+                        }
                         catch (Exception ex)
                         {
-                            Debug.WriteLine($"[WhitelistEnforcement] WMI Disable failed for {devId}: {ex.Message}");
+                            Debug.WriteLine($"[WhitelistEnforcement] WMI Disable failed for '{devId}': {ex.Message}");
                         }
                     }
                 }

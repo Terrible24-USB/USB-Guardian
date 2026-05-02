@@ -28,6 +28,13 @@ namespace USBGuardian
         private readonly Dictionary<string, KeystrokeSession> _sessions = new();
         private readonly object _lock = new();
 
+        // FIX: cap the number of concurrent sessions and evict stale entries to prevent
+        // unbounded memory growth.  Each session accumulates keystroke timestamps for its
+        // lifetime; without a bound, a long-running process that sees many HID devices
+        // would grow indefinitely.
+        private const int MaxSessions = 50;
+        private static readonly TimeSpan SessionStaleAfter = TimeSpan.FromHours(2);
+
         private static readonly List<string> SuspiciousPatterns = new()
         {
             "powershell", "cmd.exe", "wget", "curl", "invoke-expression", "iex",
@@ -44,8 +51,49 @@ namespace USBGuardian
         {
             lock (_lock)
             {
+                // Evict stale sessions before adding a new one
+                EvictStaleSessions_Locked();
+
                 _sessions[vidPid] = new KeystrokeSession { DeviceVidPid = vidPid };
                 _logger.LogInfo(3, "BehaviorMonitor", $"Started keystroke monitoring for {vidPid}", vidPid);
+            }
+        }
+
+        // Must be called under _lock
+        private void EvictStaleSessions_Locked()
+        {
+            DateTime cutoff = DateTime.UtcNow - SessionStaleAfter;
+            var stale = new List<string>();
+            foreach (var kvp in _sessions)
+            {
+                if (kvp.Value.StartTime < cutoff)
+                    stale.Add(kvp.Key);
+            }
+            foreach (var key in stale)
+            {
+                _sessions.Remove(key);
+                _logger.LogInfo(3, "BehaviorMonitor", $"Evicted stale keystroke session for {key}", key);
+            }
+
+            // If still over cap after eviction, drop oldest sessions
+            while (_sessions.Count >= MaxSessions)
+            {
+                string oldest = null;
+                DateTime oldestTime = DateTime.MaxValue;
+                foreach (var kvp in _sessions)
+                {
+                    if (kvp.Value.StartTime < oldestTime)
+                    {
+                        oldestTime = kvp.Value.StartTime;
+                        oldest = kvp.Key;
+                    }
+                }
+                if (oldest != null)
+                {
+                    _sessions.Remove(oldest);
+                    _logger.LogInfo(3, "BehaviorMonitor", $"Evicted oldest keystroke session (cap reached) for {oldest}", oldest);
+                }
+                else break;
             }
         }
 

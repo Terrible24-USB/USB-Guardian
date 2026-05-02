@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -11,8 +12,13 @@ namespace USBGuardian
     {
         private readonly SecurityEventLogger _logger;
         private readonly DeviceWhitelistManager _whitelist;
-        private string? _enabledDeviceVidPid;
-        private DateTime? _enabledUntilUtc;
+
+        // FIX: was a single (string, DateTime?) pair — only one device could be tracked at a time.
+        // Multiple USB insertions in quick succession would silently overwrite the previous entry,
+        // causing the expiry task for the first device to find a mismatched VidPid and bail out
+        // without ever re-applying any block.  Replaced with a thread-safe dictionary.
+        private readonly ConcurrentDictionary<string, DateTime> _enabledUntilByVidPid =
+            new(StringComparer.OrdinalIgnoreCase);
 
         [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
         private static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string? pDeviceID, uint ulFlags);
@@ -56,8 +62,7 @@ namespace USBGuardian
                 TriggerDeviceRescan();
                 Thread.Sleep(500);
 
-                _enabledDeviceVidPid = vidPid;
-                _enabledUntilUtc = DateTime.UtcNow.AddSeconds(enableDurationSeconds);
+                _enabledUntilByVidPid[vidPid] = DateTime.UtcNow.AddSeconds(enableDurationSeconds);
                 _logger.LogPreBootAction("TemporaryEnable",
                     $"USB storage temporarily enabled for {vidPid} for {enableDurationSeconds}s.", SecuritySeverity.Warning, vidPid);
 
@@ -66,11 +71,8 @@ namespace USBGuardian
                     try
                     {
                         await Task.Delay(TimeSpan.FromSeconds(enableDurationSeconds)).ConfigureAwait(false);
-                        if (!string.Equals(_enabledDeviceVidPid, vidPid, StringComparison.OrdinalIgnoreCase))
-                            return;
-
-                        _enabledDeviceVidPid = null;
-                        _enabledUntilUtc = null;
+                        // Remove this entry regardless — the window has expired
+                        _enabledUntilByVidPid.TryRemove(vidPid, out _);
                         _logger.LogPreBootAction("TemporaryEnable",
                             $"Temporary USB storage window expired for {vidPid}. No persistent pre-boot block re-applied.",
                             SecuritySeverity.Warning,
@@ -104,8 +106,8 @@ namespace USBGuardian
         public bool IsTemporaryWindowActive(string vidPid)
         {
             if (string.IsNullOrWhiteSpace(vidPid)) return false;
-            if (!string.Equals(_enabledDeviceVidPid, vidPid, StringComparison.OrdinalIgnoreCase)) return false;
-            return _enabledUntilUtc.HasValue && _enabledUntilUtc.Value > DateTime.UtcNow;
+            return _enabledUntilByVidPid.TryGetValue(vidPid, out DateTime expiry) &&
+                   expiry > DateTime.UtcNow;
         }
 
         private void ClearConfigFlagsForVidPid(string vidPid)

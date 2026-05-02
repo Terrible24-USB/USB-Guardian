@@ -150,6 +150,23 @@ namespace USBGuardian
             }
         }
 
+        /// <summary>
+        /// Starts real-time keystroke behaviour monitoring for the given VID:PID.
+        /// Call this after allowing a HID (keyboard/mouse) device so that Layer 3
+        /// RubberDucky detection becomes active for that device.
+        /// </summary>
+        public void StartKeystrokeMonitoring(string vidPid)
+        {
+            try
+            {
+                _securityEngine.StartKeystrokeMonitoring(vidPid);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[UsbGuardianCore] StartKeystrokeMonitoring failed: {ex.Message}");
+            }
+        }
+
         public bool TemporarilyEnableUsbStorage(DeviceFingerprint fingerprint, int enableDurationSeconds = 60)
         {
             try
