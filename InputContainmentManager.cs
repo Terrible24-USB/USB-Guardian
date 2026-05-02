@@ -30,13 +30,9 @@ namespace USBGuardian
         private const int WH_KEYBOARD_LL = 13;
         private const int WH_MOUSE_LL = 14;
         private const int HC_ACTION = 0;
-
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_KEYUP = 0x0101;
         private const int WM_SYSKEYDOWN = 0x0104;
-        private const int WM_SYSKEYUP = 0x0105;
-
-        public bool IsActive => Volatile.Read(ref _activationCount) > 0;
 
         public bool IsActive => Volatile.Read(ref _activeFlag) == 1;
 
@@ -112,14 +108,12 @@ namespace USBGuardian
 
         private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode == HC_ACTION && IsActive && !IsTrustedUiForeground())
-            {
-                int msg = wParam.ToInt32();
-                if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)
-                    return (IntPtr)1;
-            }
+            if (nCode != HC_ACTION || !IsActive)
+                return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
 
-            if (ShouldBlockEvent(nCode))
+            // Allow interaction with the guardian's own decision UI while still
+            // blocking input to other processes/windows.
+            if (!IsForegroundOwnedByCurrentProcess())
                 return (IntPtr)1;
 
             return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
@@ -127,38 +121,25 @@ namespace USBGuardian
 
         private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode == HC_ACTION && IsActive && !IsTrustedUiForeground())
-            if (ShouldBlockEvent(nCode))
+            if (nCode != HC_ACTION || !IsActive)
+                return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+
+            if (!IsForegroundOwnedByCurrentProcess())
                 return (IntPtr)1;
 
             return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
         }
 
-        private static bool IsTrustedUiForeground()
+        private static bool IsForegroundOwnedByCurrentProcess()
         {
-            IntPtr hwnd = GetForegroundWindow();
-            if (hwnd == IntPtr.Zero)
+            IntPtr fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero)
                 return false;
 
-            _ = GetWindowThreadProcessId(hwnd, out uint pid);
-            return pid == (uint)CurrentProcessId;
+            _ = GetWindowThreadProcessId(fg, out uint pid);
+            return pid == (uint)Environment.ProcessId;
         }
 
-        public void Dispose()
-        {
-            if (_disposed) return;
-            lock (_stateLock)
-            {
-                if (_disposed) return;
-                _disposed = true;
-                Interlocked.Exchange(ref _activationCount, 0);
-                CleanupHooks_NoThrow();
-            }
-        }
-
-        private void CleanupHooks_NoThrow()
-        {
-            try
         public void Dispose()
         {
             if (_disposed) return;
@@ -224,14 +205,6 @@ namespace USBGuardian
         [DllImport("user32.dll")]
         private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern IntPtr GetModuleHandle(string? lpModuleName);
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetForegroundWindow();
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
 
