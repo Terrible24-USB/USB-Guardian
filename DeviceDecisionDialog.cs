@@ -62,6 +62,7 @@ namespace USBGuardian
                     form.WindowState = FormWindowState.Normal;
                     form.Activate();
                     form.BringToFront();
+                    form.Focus();
                     onDialogShown?.Invoke(form.Handle);
                 }
                 catch { }
@@ -140,6 +141,7 @@ namespace USBGuardian
             {
                 txtDetails, chkNeverAsk, btnAllow, btnWhitelist, btnBlock, btnIgnore, lblShortcuts
             });
+            form.ActiveControl = btnBlock;
 
             using var timeoutTimer = new System.Windows.Forms.Timer { Interval = timeoutSeconds * 1000 };
             timeoutTimer.Tick += (_, _) =>

@@ -175,7 +175,7 @@ namespace USBGuardian
 
             // Always allow input to our own trusted window.
             IntPtr fg = GetForegroundWindow();
-            if (fg != IntPtr.Zero && (fg == _trustedHwnd || IsOwnedByCurrentProcess(fg)))
+            if (IsTrustedContextWindow(fg))
                 return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
 
             // Whitelist: only let through keys needed for the decision dialog.
@@ -197,10 +197,29 @@ namespace USBGuardian
                 return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
 
             IntPtr fg = GetForegroundWindow();
-            if (fg != IntPtr.Zero && (fg == _trustedHwnd || IsOwnedByCurrentProcess(fg)))
+            if (IsTrustedContextWindow(fg))
+                return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+
+            var mouse = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+            IntPtr underCursor = WindowFromPoint(mouse.pt);
+            if (IsTrustedContextWindow(underCursor))
                 return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
 
             return (IntPtr)1; // block
+        }
+
+
+        private bool IsTrustedContextWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            if (IsOwnedByCurrentProcess(hwnd)) return true;
+
+            IntPtr trusted;
+            lock (_stateLock) trusted = _trustedHwnd;
+            if (trusted == IntPtr.Zero) return false;
+
+            if (hwnd == trusted) return true;
+            return IsChild(trusted, hwnd);
         }
 
         private static bool IsOwnedByCurrentProcess(IntPtr hwnd)
