@@ -13,7 +13,14 @@ namespace USBGuardian
         private readonly SecurityEventLogger _logger;
         private readonly DeviceWhitelistManager _whitelist;
         private readonly object _lock = new();
-        private readonly Dictionary<string, DateTime> _enabledDevices = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, TemporaryEnableWindow> _enabledDevices = new(StringComparer.OrdinalIgnoreCase);
+        private long _enableToken;
+
+        private sealed class TemporaryEnableWindow
+        {
+            public DateTime ExpiresUtc { get; set; }
+            public long Token { get; set; }
+        }
 
         [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
         private static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string? pDeviceID, uint ulFlags);
@@ -58,9 +65,15 @@ namespace USBGuardian
                 Thread.Sleep(500);
 
                 DateTime expiresUtc = DateTime.UtcNow.AddSeconds(enableDurationSeconds);
+                long token;
                 lock (_lock)
                 {
-                    _enabledDevices[vidPid] = expiresUtc;
+                    token = ++_enableToken;
+                    _enabledDevices[vidPid] = new TemporaryEnableWindow
+                    {
+                        ExpiresUtc = expiresUtc,
+                        Token = token
+                    };
                 }
                 _logger.LogPreBootAction("TemporaryEnable",
                     $"USB storage temporarily enabled for {vidPid} for {enableDurationSeconds}s.", SecuritySeverity.Warning, vidPid);
@@ -73,9 +86,9 @@ namespace USBGuardian
                         bool expired = false;
                         lock (_lock)
                         {
-                            if (_enabledDevices.TryGetValue(vidPid, out DateTime currentExpiry) &&
-                                currentExpiry == expiresUtc &&
-                                currentExpiry <= DateTime.UtcNow)
+                            if (_enabledDevices.TryGetValue(vidPid, out TemporaryEnableWindow window) &&
+                                window.Token == token &&
+                                window.ExpiresUtc <= DateTime.UtcNow)
                             {
                                 _enabledDevices.Remove(vidPid);
                                 expired = true;
@@ -120,10 +133,10 @@ namespace USBGuardian
             if (string.IsNullOrWhiteSpace(vidPid)) return false;
             lock (_lock)
             {
-                if (!_enabledDevices.TryGetValue(vidPid, out DateTime expiresUtc))
+                if (!_enabledDevices.TryGetValue(vidPid, out TemporaryEnableWindow window))
                     return false;
 
-                if (expiresUtc <= DateTime.UtcNow)
+                if (window.ExpiresUtc <= DateTime.UtcNow)
                 {
                     _enabledDevices.Remove(vidPid);
                     return false;
