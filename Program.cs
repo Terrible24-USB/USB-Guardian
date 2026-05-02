@@ -120,6 +120,7 @@ namespace USBGuardian
         private readonly Dictionary<string, DateTime> _lastDecisionPromptUtc = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, BlockedDeviceRecord> _temporaryDecisionBlocks = new(StringComparer.OrdinalIgnoreCase);
         private readonly InputContainmentManager _inputContainment;
+        private readonly ContainmentController _containmentController;
         private readonly PnpDeviceGuard _pnpGuard;
 
         public USBMessageWindow()
@@ -162,15 +163,7 @@ namespace USBGuardian
                 dryRun: unblockManager.DryRun);
 
             _inputContainment = new InputContainmentManager(guardianCore.EventLogger);
-            try
-            {
-                _inputContainment.InitializeHooks();
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[Startup] Input containment hook install failed: {ex.Message}");
-                guardianCore?.EventLogger?.LogWarning(0, "SinkMode", $"Hook install failed at startup: {ex.Message}");
-            }
+            _containmentController = new ContainmentController(_inputContainment);
             Application.ApplicationExit += (_, _) => _inputContainment.Dispose();
 
             // PnP fast-path: fires ~10-30ms after insertion, before HID stack completes.
@@ -649,8 +642,7 @@ namespace USBGuardian
 
                 DeviceDecisionResult decisionResult;
 
-                var containmentScope = new InputContainmentManager.ContainmentScope(_inputContainment, $"Decision prompt for {decisionKey}");
-                _inputContainment.Activate($"Decision prompt for {decisionKey}");
+                using var containmentScope = _containmentController.Enter($"Decision prompt for {decisionKey}");
 
                 try
                 {
@@ -660,7 +652,6 @@ namespace USBGuardian
                 }
                 finally
                 {
-                    _inputContainment.Deactivate($"Decision prompt closed for {decisionKey}");
                     EndDecisionPrompt(decisionKey);
                 }
 
