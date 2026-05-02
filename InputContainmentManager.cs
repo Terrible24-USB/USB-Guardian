@@ -31,6 +31,11 @@ namespace USBGuardian
         private const int HC_ACTION = 0;
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_SYSKEYDOWN = 0x0104;
+        private const int LLKHF_ALTDOWN = 0x20;
+        private const int VK_LWIN = 0x5B;
+        private const int VK_RWIN = 0x5C;
+        private const int VK_ESCAPE = 0x1B;
+        private const int VK_F4 = 0x73;
 
         private readonly SecurityEventLogger _logger;
         private readonly object _stateLock = new();
@@ -178,17 +183,22 @@ namespace USBGuardian
             if (IsTrustedContextWindow(fg))
                 return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
 
-            // Whitelist: only let through keys needed for the decision dialog.
-            int msg = wParam.ToInt32();
-            if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+            var keyInfo = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+            if (IsDangerousCombo(keyInfo))
+                return (IntPtr)1;
+
+            IntPtr fg = GetForegroundWindow();
+            if (IsTrustedContextWindow(fg))
             {
-                int vk = Marshal.ReadInt32(lParam);
+                int vk = unchecked((int)keyInfo.vkCode);
                 foreach (var k in AllowedKeys)
                     if (vk == (int)k)
                         return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+
+                return (IntPtr)1;
             }
 
-            return (IntPtr)1; // block
+            return (IntPtr)1;
         }
 
         private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -205,7 +215,23 @@ namespace USBGuardian
             if (IsTrustedContextWindow(underCursor))
                 return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
 
-            return (IntPtr)1; // block
+        private static bool IsDangerousCombo(KBDLLHOOKSTRUCT keyInfo)
+        {
+            int vk = unchecked((int)keyInfo.vkCode);
+            bool altDown = (keyInfo.flags & LLKHF_ALTDOWN) != 0;
+            bool ctrlDown = (GetKeyState(0x11) & 0x8000) != 0;
+            bool winDown = (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0;
+
+            if (vk == VK_LWIN || vk == VK_RWIN)
+                return true;
+            if (winDown)
+                return true;
+            if (ctrlDown && vk == VK_ESCAPE)
+                return true;
+            if (altDown && vk == VK_F4)
+                return true;
+
+            return false;
         }
 
 
@@ -224,8 +250,19 @@ namespace USBGuardian
 
         private static bool IsOwnedByCurrentProcess(IntPtr hwnd)
         {
-            GetWindowThreadProcessId(hwnd, out uint pid);
-            return pid == (uint)Environment.ProcessId;
+            if (hwnd == IntPtr.Zero) return false;
+
+            IntPtr trusted;
+            lock (_stateLock) trusted = _trustedHwnd;
+            if (trusted == IntPtr.Zero) return false;
+
+            IntPtr trustedRoot = GetAncestor(trusted, 3);
+            IntPtr hwndRoot = GetAncestor(hwnd, 3);
+            if (trustedRoot != IntPtr.Zero && trustedRoot == hwndRoot)
+                return true;
+
+            if (hwnd == trusted) return true;
+            return IsChild(trusted, hwnd);
         }
 
         private void ThrowIfDisposed()
@@ -285,9 +322,6 @@ namespace USBGuardian
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
-
-        [DllImport("user32.dll")]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr GetModuleHandle(string? lpModuleName);
