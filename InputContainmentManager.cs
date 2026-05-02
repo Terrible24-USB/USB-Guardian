@@ -38,6 +38,8 @@ namespace USBGuardian
 
         public bool IsActive => Volatile.Read(ref _activationCount) > 0;
 
+        public bool IsActive => Volatile.Read(ref _activeFlag) == 1;
+
         public InputContainmentManager(SecurityEventLogger logger)
         {
             _logger = logger;
@@ -117,12 +119,16 @@ namespace USBGuardian
                     return (IntPtr)1;
             }
 
+            if (ShouldBlockEvent(nCode))
+                return (IntPtr)1;
+
             return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
         }
 
         private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode == HC_ACTION && IsActive && !IsTrustedUiForeground())
+            if (ShouldBlockEvent(nCode))
                 return (IntPtr)1;
 
             return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
@@ -153,6 +159,13 @@ namespace USBGuardian
         private void CleanupHooks_NoThrow()
         {
             try
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+
+            lock (_stateLock)
+
             {
                 if (_keyboardHook != IntPtr.Zero)
                 {
@@ -219,5 +232,14 @@ namespace USBGuardian
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
     }
 }
