@@ -44,6 +44,21 @@ namespace USBGuardian
         private bool _disposed;
 
         /// <summary>
+        /// When true (default), CM_Disable_DevNode is called atomically inside
+        /// OnPnpNotification before DeviceArrived is raised, saving the ~1-3ms
+        /// round-trip through the caller's event handler and ensuring no keystroke
+        /// report can arrive in the gap between detection and the caller's freeze.
+        /// </summary>
+        public bool FreezeOnArrival { get; set; } = true;
+
+        /// <summary>
+        /// Raised when a device has been frozen atomically in the PnP callback
+        /// (only fires when <see cref="FreezeOnArrival"/> is true and the freeze
+        /// succeeds).  Arguments: (instanceId, elapsedMs from detection to freeze).
+        /// </summary>
+        public event Action<string, long>? ArrivalFrozen;
+
+        /// <summary>
         /// Raised on the PnP thread the moment a new USB device interface arrives.
         /// The string argument is the symbolic device path (\\?\USB\...).
         /// </summary>
@@ -121,6 +136,22 @@ namespace USBGuardian
         }
 
         /// <summary>
+        /// Converts a device symbolic link to a PnP instance ID.
+        /// e.g. "\\?\USB#VID_1234&amp;PID_5678#ABC#{guid}" → "USB\VID_1234&amp;PID_5678\ABC"
+        /// </summary>
+        public static string SymbolicLinkToInstanceId(string symLink)
+        {
+            if (string.IsNullOrWhiteSpace(symLink)) return string.Empty;
+            // Strip leading \\?\ or \\.\
+            string s = symLink.TrimStart('\\').TrimStart('?').TrimStart('.').TrimStart('\\');
+            // Remove trailing {guid} segment
+            int brace = s.LastIndexOf('{');
+            if (brace > 0) s = s.Substring(0, brace).TrimEnd('#').TrimEnd('\\');
+            // Replace # with \
+            return s.Replace('#', '\\').Trim('\\');
+        }
+
+        /// <summary>
         /// Disables the device node identified by its PnP device-instance ID
         /// (e.g. "USB\\VID_1234&PID_5678\\ABC123").
         /// Returns true on success.
@@ -195,6 +226,27 @@ namespace USBGuardian
                     // struct is naturally aligned so this is reliable).
                     string symLink = ReadSymbolicLink(EventData, EventDataSize);
                     Debug.WriteLine($"[PnpDeviceGuard] Arrival: {symLink}");
+
+                    // FreezeOnArrival: call CM_Disable_DevNode atomically inside this
+                    // callback, before DeviceArrived is raised.  This closes the ~1-3ms
+                    // gap that would otherwise exist between the event firing and the
+                    // caller's handler running.
+                    if (FreezeOnArrival)
+                    {
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
+                        string id = SymbolicLinkToInstanceId(symLink ?? string.Empty);
+                        if (!string.IsNullOrWhiteSpace(id))
+                        {
+                            bool frozen = DisableDevNode(id);
+                            sw.Stop();
+                            Debug.WriteLine(
+                                $"[PnpDeviceGuard] FreezeOnArrival: {sw.ElapsedMilliseconds}ms " +
+                                $"frozen={frozen} id={id}");
+                            if (frozen)
+                                ArrivalFrozen?.Invoke(id, sw.ElapsedMilliseconds);
+                        }
+                    }
+
                     DeviceArrived?.Invoke(symLink ?? string.Empty);
                 }
             }

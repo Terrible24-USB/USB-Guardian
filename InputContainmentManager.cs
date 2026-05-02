@@ -24,6 +24,11 @@ namespace USBGuardian
             System.Windows.Forms.Keys.Return,
             System.Windows.Forms.Keys.Escape,
             System.Windows.Forms.Keys.Tab,
+            // Arrow keys for accessibility — navigate dialog buttons
+            System.Windows.Forms.Keys.Up,
+            System.Windows.Forms.Keys.Down,
+            System.Windows.Forms.Keys.Left,
+            System.Windows.Forms.Keys.Right,
         };
 
         private const int WH_KEYBOARD_LL = 13;
@@ -35,6 +40,7 @@ namespace USBGuardian
         private const int VK_LWIN = 0x5B;
         private const int VK_RWIN = 0x5C;
         private const int VK_ESCAPE = 0x1B;
+        private const int VK_TAB = 0x09;
         private const int VK_F4 = 0x73;
 
         private readonly SecurityEventLogger _logger;
@@ -48,6 +54,8 @@ namespace USBGuardian
         private int _activeFlag;
         private bool _hooksInstalled;
         private bool _disposed;
+        // Ticks until which the 2-second aggressive lockdown is active (allows only Enter/Esc).
+        private long _aggressiveLockdownUntilTicks;
 
         public bool IsActive => Volatile.Read(ref _activeFlag) == 1;
 
@@ -66,13 +74,18 @@ namespace USBGuardian
             }
 
             FlushPendingInputState();
+            // Start 2-second aggressive lockdown: only Enter/Esc pass through during
+            // this window to stop any buffered Ducky keystrokes from reaching the dialog.
+            Interlocked.Exchange(ref _aggressiveLockdownUntilTicks,
+                DateTime.UtcNow.AddSeconds(2).Ticks);
             Volatile.Write(ref _activeFlag, 1);
-            _logger.LogInfo(0, "InputContainment", $"Activated: {reason}");
+            _logger.LogInfo(0, "InputContainment", $"Activated (2s aggressive lockdown): {reason}");
         }
 
         public void Deactivate(string reason)
         {
             Volatile.Write(ref _activeFlag, 0);
+            Interlocked.Exchange(ref _aggressiveLockdownUntilTicks, 0);
             lock (_stateLock) _trustedHwnd = IntPtr.Zero;
             ReleaseHooks();
             _logger.LogInfo(0, "InputContainment", $"Deactivated: {reason}");
@@ -178,15 +191,24 @@ namespace USBGuardian
             if (nCode != HC_ACTION || !IsActive)
                 return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
 
-            // Always allow input to our own trusted window.
-            IntPtr fg = GetForegroundWindow();
-            if (IsTrustedContextWindow(fg))
-                return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
-
             var keyInfo = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+
+            // Always block dangerous system combos (Win, Alt+Tab, Ctrl+Esc, etc.)
+            // regardless of which window is focused — these open execution paths.
             if (IsDangerousCombo(keyInfo))
                 return (IntPtr)1;
 
+            // During the 2-second aggressive lockdown window, allow only Enter/Esc
+            // to stop buffered Ducky keystrokes from reaching the dialog.
+            long lockdownTicks = Volatile.Read(ref _aggressiveLockdownUntilTicks);
+            if (lockdownTicks != 0 && DateTime.UtcNow.Ticks < lockdownTicks)
+            {
+                int vkLock = unchecked((int)keyInfo.vkCode);
+                if (vkLock != 0x0D && vkLock != 0x1B) // VK_RETURN, VK_ESCAPE
+                    return (IntPtr)1;
+            }
+
+            // If our trusted decision window is focused, allow only whitelisted keys.
             IntPtr fg = GetForegroundWindow();
             if (IsTrustedContextWindow(fg))
             {
@@ -215,20 +237,36 @@ namespace USBGuardian
             if (IsTrustedContextWindow(underCursor))
                 return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
 
+            return (IntPtr)1;
+        }
+
         private static bool IsDangerousCombo(KBDLLHOOKSTRUCT keyInfo)
         {
             int vk = unchecked((int)keyInfo.vkCode);
             bool altDown = (keyInfo.flags & LLKHF_ALTDOWN) != 0;
             bool ctrlDown = (GetKeyState(0x11) & 0x8000) != 0;
+            bool shiftDown = (GetKeyState(0x10) & 0x8000) != 0;
             bool winDown = (GetKeyState(VK_LWIN) & 0x8000) != 0 || (GetKeyState(VK_RWIN) & 0x8000) != 0;
 
+            // Block Win key alone and any Win+key combo (Start menu, Win+R Run, etc.)
             if (vk == VK_LWIN || vk == VK_RWIN)
                 return true;
             if (winDown)
                 return true;
+            // Block Ctrl+Esc → Start menu
             if (ctrlDown && vk == VK_ESCAPE)
                 return true;
+            // Block Alt+F4 → close window
             if (altDown && vk == VK_F4)
+                return true;
+            // Block Alt+Tab → task switch
+            if (altDown && vk == VK_TAB)
+                return true;
+            // Block Alt+Esc → minimize/cycle without showing switcher
+            if (altDown && vk == VK_ESCAPE)
+                return true;
+            // Block Ctrl+Shift+Esc → Task Manager
+            if (ctrlDown && shiftDown && vk == VK_ESCAPE)
                 return true;
 
             return false;
@@ -248,7 +286,7 @@ namespace USBGuardian
             return IsChild(trusted, hwnd);
         }
 
-        private static bool IsOwnedByCurrentProcess(IntPtr hwnd)
+        private bool IsOwnedByCurrentProcess(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero) return false;
 
@@ -328,5 +366,45 @@ namespace USBGuardian
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        [DllImport("user32.dll")]
+        private static extern short GetKeyState(int nVirtKey);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(POINT point);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int x;
+            public int y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSLLHOOKSTRUCT
+        {
+            public POINT pt;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
     }
 }

@@ -122,6 +122,7 @@ namespace USBGuardian
         private readonly InputContainmentManager _inputContainment;
         private readonly ContainmentController _containmentController;
         private readonly PnpDeviceGuard _pnpGuard;
+        private readonly RubberDuckyDefense _rubberDuckyDefense;
 
         public USBMessageWindow()
         {
@@ -166,9 +167,13 @@ namespace USBGuardian
             _containmentController = new ContainmentController(_inputContainment);
             Application.ApplicationExit += (_, _) => _inputContainment.Dispose();
 
+            // RubberDuckyDefense: orchestrates Layer 2 (freeze) + Layer 3 (flush).
+            _rubberDuckyDefense = new RubberDuckyDefense(guardianCore.EventLogger);
+
             // PnP fast-path: fires ~10-30ms after insertion, before HID stack completes.
-            // Used to immediately freeze unknown devices via CM_Disable_DevNode.
-            _pnpGuard = new PnpDeviceGuard();
+            // FreezeOnArrival=true means the device is frozen atomically inside the
+            // PnP callback before DeviceArrived is raised (saves ~1-3ms vs. handler path).
+            _pnpGuard = new PnpDeviceGuard { FreezeOnArrival = false }; // freeze via RubberDuckyDefense
             _pnpGuard.DeviceArrived += OnPnpDeviceArrived;
             try
             {
@@ -394,30 +399,24 @@ namespace USBGuardian
 
         /// <summary>
         /// Called by PnpDeviceGuard ~10-30ms after USB insertion, before the HID
-        /// driver finishes loading.  We immediately disable the device node so that
-        /// a Rubber Ducky cannot send a single keystroke.  The WM_DEVICECHANGE /
-        /// WndProc path still runs afterwards to handle the full decision flow.
+        /// driver finishes loading.  Delegates to RubberDuckyDefense which performs
+        /// Layer 2 (CM_Disable_DevNode freeze) and Layer 3 (input queue flush).
+        /// The WM_DEVICECHANGE / WndProc path still runs afterwards to handle the
+        /// full decision flow (Layer 4 containment + dialog).
         /// </summary>
         private void OnPnpDeviceArrived(string symbolicLink)
         {
             try
             {
-                // Derive the device instance ID from the symbolic link.
-                // Symbolic link format: \\?\USB#VID_xxxx&PID_xxxx#instanceId#{guid}
-                // We need: USB\VID_xxxx&PID_xxxx\instanceId
-                string instanceId = SymbolicLinkToInstanceId(symbolicLink);
-                if (string.IsNullOrWhiteSpace(instanceId)) return;
+                bool frozen = _rubberDuckyDefense.HandleArrival(
+                    symbolicLink, out string instanceId, out long freezeMs);
 
-                // Only freeze HID-class or unknown devices — storage devices are
-                // handled by the existing EarlyBlockUsbInstanceKey path.
-                // We freeze everything here and let ProcessUsbDevice sort it out.
-                bool frozen = PnpDeviceGuard.DisableDevNode(instanceId);
-                if (frozen)
+                if (frozen && !string.IsNullOrWhiteSpace(instanceId))
                 {
                     _pnpFrozenInstances[instanceId] = true;
                     guardianCore?.EventLogger?.LogWarning(0, "PnpGuard",
-                        $"Device frozen at PnP arrival: {instanceId}");
-                    Debug.WriteLine($"[PnpGuard] Frozen: {instanceId}");
+                        $"Device frozen at PnP arrival in {freezeMs}ms: {instanceId}");
+                    Debug.WriteLine($"[PnpGuard] Frozen in {freezeMs}ms: {instanceId}");
                 }
             }
             catch (Exception ex)
@@ -431,16 +430,7 @@ namespace USBGuardian
         /// e.g. "\\?\USB#VID_1234&PID_5678#ABC#{guid}" → "USB\VID_1234&PID_5678\ABC"
         /// </summary>
         private static string SymbolicLinkToInstanceId(string symLink)
-        {
-            if (string.IsNullOrWhiteSpace(symLink)) return string.Empty;
-            // Strip leading \\?\ or \\.\
-            string s = symLink.TrimStart('\\').TrimStart('?').TrimStart('.').TrimStart('\\');
-            // Remove trailing {guid} segment
-            int brace = s.LastIndexOf('{');
-            if (brace > 0) s = s.Substring(0, brace).TrimEnd('#').TrimEnd('\\');
-            // Replace # with \
-            return s.Replace('#', '\\').Trim('\\');
-        }
+            => PnpDeviceGuard.SymbolicLinkToInstanceId(symLink);
 
         private static string SafeGetString(ManagementObject obj, string propertyName)
         {

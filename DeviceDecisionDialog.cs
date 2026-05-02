@@ -113,8 +113,24 @@ namespace USBGuardian
                 ForeColor = Color.DimGray
             };
 
+            // ── aggressive lockdown window (2 seconds) ──────────────────────────────
+            // During the first 2 seconds after the dialog appears, only Enter/Esc are
+            // accepted via the form's own KeyDown handler.  The global low-level hooks
+            // in InputContainmentManager already enforce this system-wide; this is an
+            // extra in-dialog layer to catch any edge cases.
+            DateTime lockdownUntil = DateTime.UtcNow.AddSeconds(2);
+
             form.KeyDown += (_, e) =>
             {
+                // During aggressive lockdown, suppress all keys except Enter/Esc.
+                if (DateTime.UtcNow < lockdownUntil &&
+                    e.KeyCode != Keys.Return && e.KeyCode != Keys.Escape)
+                {
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                    return;
+                }
+
                 if (e.KeyCode == Keys.A)
                 {
                     btnAllow.PerformClick();
