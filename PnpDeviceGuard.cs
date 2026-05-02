@@ -44,12 +44,14 @@ namespace USBGuardian
         private bool _disposed;
 
         /// <summary>
-        /// When true (default), CM_Disable_DevNode is called atomically inside
+        /// When true, CM_Disable_DevNode is called atomically inside
         /// OnPnpNotification before DeviceArrived is raised, saving the ~1-3ms
         /// round-trip through the caller's event handler and ensuring no keystroke
         /// report can arrive in the gap between detection and the caller's freeze.
+        /// Default is false; set to true when no external orchestrator (e.g.
+        /// RubberDuckyDefense) handles the freeze in the DeviceArrived handler.
         /// </summary>
-        public bool FreezeOnArrival { get; set; } = true;
+        public bool FreezeOnArrival { get; set; } = false;
 
         /// <summary>
         /// Raised when a device has been frozen atomically in the PnP callback
