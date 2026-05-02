@@ -31,6 +31,8 @@ namespace USBGuardian
         private static readonly TimeSpan IdleSessionThreshold = TimeSpan.FromHours(2);
         private static readonly TimeSpan KeystrokeHistoryWindow = TimeSpan.FromMinutes(5);
         private const int MaxKeystrokeSamples = 2000;
+        private static readonly TimeSpan PruneInterval = TimeSpan.FromMinutes(5);
+        private DateTime _lastPruneUtc = DateTime.MinValue;
 
         private static readonly List<string> SuspiciousPatterns = new()
         {
@@ -180,6 +182,10 @@ namespace USBGuardian
 
         private void PruneIdleSessions(DateTime nowUtc)
         {
+            if (nowUtc - _lastPruneUtc < PruneInterval)
+                return;
+
+            _lastPruneUtc = nowUtc;
             var stale = new List<string>();
             foreach (var entry in _sessions)
             {

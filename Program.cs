@@ -127,7 +127,7 @@ namespace USBGuardian
         private readonly object _decisionPromptLock = new();
         private readonly HashSet<string> _pendingDecisionKeys = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _lastDecisionPromptUtc = new(StringComparer.OrdinalIgnoreCase);
-        private bool _disposed;
+        private volatile bool _disposed;
 
         public USBMessageWindow()
         {
@@ -716,11 +716,22 @@ namespace USBGuardian
                 // Otherwise, marshal to the UI thread using the hidden _invokeTarget control.
                 // Control.Invoke is the most reliable cross-thread UI dispatch mechanism in WinForms.
                 DeviceDecisionResult decision = new() { Action = DeviceDecisionAction.Block };
-                _invokeTarget.Invoke((Action)(() =>
+                try
                 {
-                    decision = DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds);
-                }));
-                return decision;
+                    _invokeTarget.Invoke((Action)(() =>
+                    {
+                        decision = DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds);
+                    }));
+                    return decision;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return new DeviceDecisionResult { Action = DeviceDecisionAction.Block, PromptFailed = true };
+                }
+                catch (InvalidOperationException)
+                {
+                    return new DeviceDecisionResult { Action = DeviceDecisionAction.Block, PromptFailed = true };
+                }
             }
             catch (Exception ex)
             {
