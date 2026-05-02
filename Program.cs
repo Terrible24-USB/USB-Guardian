@@ -68,12 +68,19 @@ namespace USBGuardian
         {
             window = new USBMessageWindow();
         }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                window?.Dispose();
+            base.Dispose(disposing);
+        }
     }
 
     // =============================
     // MAIN USB MESSAGE WINDOW
     // =============================
-    class USBMessageWindow : NativeWindow
+    class USBMessageWindow : NativeWindow, IDisposable
     {
         private const int WM_DEVICECHANGE = 0x0219;
         private const int DBT_DEVICEARRIVAL = 0x8000;
@@ -120,6 +127,7 @@ namespace USBGuardian
         private readonly object _decisionPromptLock = new();
         private readonly HashSet<string> _pendingDecisionKeys = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _lastDecisionPromptUtc = new(StringComparer.OrdinalIgnoreCase);
+        private bool _disposed;
 
         public USBMessageWindow()
         {
@@ -698,6 +706,12 @@ namespace USBGuardian
                 // If we are already on the UI thread, show the dialog directly.
                 if (Thread.CurrentThread.ManagedThreadId == _uiThreadId)
                     return DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds);
+
+                if (_disposed || _invokeTarget.IsDisposed)
+                    return new DeviceDecisionResult { Action = DeviceDecisionAction.Block, PromptFailed = true };
+
+                if (!_invokeTarget.IsHandleCreated)
+                    _invokeTarget.CreateControl();
 
                 // Otherwise, marshal to the UI thread using the hidden _invokeTarget control.
                 // Control.Invoke is the most reliable cross-thread UI dispatch mechanism in WinForms.
@@ -1673,6 +1687,20 @@ namespace USBGuardian
         {
             return !string.IsNullOrWhiteSpace(record.BlockReason) &&
                    record.BlockReason.StartsWith(TemporaryDecisionBlockReasonPrefix, StringComparison.OrdinalIgnoreCase);
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+            trayIcon?.Dispose();
+            _invokeTarget?.Dispose();
+            _deviceProcessingSemaphore?.Dispose();
+            if (Handle != IntPtr.Zero)
+                DestroyHandle();
+            GC.SuppressFinalize(this);
         }
 
         // =============================

@@ -63,7 +63,7 @@ namespace USBGuardian
             lock (_lock)
             {
                 PruneIdleSessions(DateTime.UtcNow);
-                var session = GetOrCreateSession(vidPid);
+                var session = GetOrCreateSessionLocked(vidPid);
                 session.LastActivityUtc = DateTime.UtcNow;
                 session.KeystrokeTimestamps.Add(timestamp);
                 TrimKeystrokeHistory(session, timestamp);
@@ -75,7 +75,7 @@ namespace USBGuardian
             lock (_lock)
             {
                 PruneIdleSessions(DateTime.UtcNow);
-                var session = GetOrCreateSession(vidPid);
+                var session = GetOrCreateSessionLocked(vidPid);
                 session.LastActivityUtc = DateTime.UtcNow;
 
                 // Scan for suspicious command patterns (primary purpose of RecordText)
@@ -163,7 +163,7 @@ namespace USBGuardian
             return result;
         }
 
-        private KeystrokeSession GetOrCreateSession(string vidPid)
+        private KeystrokeSession GetOrCreateSessionLocked(string vidPid)
         {
             if (_sessions.TryGetValue(vidPid, out var session))
                 return session;
@@ -194,7 +194,7 @@ namespace USBGuardian
             }
         }
 
-        private static void TrimKeystrokeHistory(KeystrokeSession session, DateTime currentTimestamp)
+        private void TrimKeystrokeHistory(KeystrokeSession session, DateTime currentTimestamp)
         {
             var timestamps = session.KeystrokeTimestamps;
             if (timestamps.Count == 0)
