@@ -1,26 +1,37 @@
 using System;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace USBGuardian
 {
+    /// <summary>
+    /// Process-wide input containment gate.
+    /// Hooks are installed once at startup and remain resident.
+    /// Activation is reference-counted so overlapping callers cannot
+    /// accidentally disable containment early.
+    /// </summary>
     internal sealed class InputContainmentManager : IDisposable
     {
         private readonly SecurityEventLogger _logger;
         private readonly object _stateLock = new();
 
-        private IntPtr _keyboardHook = IntPtr.Zero;
-        private IntPtr _mouseHook = IntPtr.Zero;
+        private IntPtr _keyboardHook;
+        private IntPtr _mouseHook;
         private LowLevelKeyboardProc? _keyboardProc;
         private LowLevelMouseProc? _mouseProc;
-        private int _activeFlag;
+
+        private int _activationCount;
         private bool _disposed;
+
+        private static readonly int CurrentProcessId = Process.GetCurrentProcess().Id;
 
         private const int WH_KEYBOARD_LL = 13;
         private const int WH_MOUSE_LL = 14;
         private const int HC_ACTION = 0;
         private const int WM_KEYDOWN = 0x0100;
+        private const int WM_KEYUP = 0x0101;
         private const int WM_SYSKEYDOWN = 0x0104;
 
         public bool IsActive => Volatile.Read(ref _activeFlag) == 1;
@@ -34,38 +45,65 @@ namespace USBGuardian
         {
             lock (_stateLock)
             {
+                ThrowIfDisposed();
                 if (_keyboardHook != IntPtr.Zero && _mouseHook != IntPtr.Zero)
                     return;
 
                 _keyboardProc = KeyboardHookCallback;
                 _mouseProc = MouseHookCallback;
 
-                _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, GetModuleHandle(null), 0);
-                _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, GetModuleHandle(null), 0);
+                IntPtr moduleHandle = GetModuleHandle(null);
+                _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, moduleHandle, 0);
+                _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, moduleHandle, 0);
 
                 if (_keyboardHook == IntPtr.Zero || _mouseHook == IntPtr.Zero)
                 {
                     int err = Marshal.GetLastWin32Error();
-                    _logger.LogWarning(0, "SinkMode", $"Failed to install low-level hooks (Win32={err})");
-                    Debug.WriteLine($"[SinkMode] Hook installation failed: {err}");
+                    CleanupHooks_NoThrow();
+                    throw new Win32Exception(err, "Unable to install low-level input hooks.");
                 }
-                else
-                {
-                    _logger.LogInfo(0, "SinkMode", "Low-level keyboard/mouse hooks installed.");
-                }
+
+                _logger.LogInfo(0, "SinkMode", "Low-level keyboard/mouse hooks installed.");
             }
         }
 
-        public void Activate(string reason)
+        public ContainmentScope BeginContainment(string reason)
         {
-            Volatile.Write(ref _activeFlag, 1);
-            _logger.LogWarning(0, "SinkMode", $"Activated containment: {reason}");
+            lock (_stateLock)
+            {
+                ThrowIfDisposed();
+                if (_keyboardHook == IntPtr.Zero || _mouseHook == IntPtr.Zero)
+                {
+                    try { InitializeHooks(); }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(0, "SinkMode", $"Containment hook init failed: {ex.Message}");
+                        Debug.WriteLine($"[SinkMode] BeginContainment init failed: {ex}");
+                    }
+                }
+
+                int count = Interlocked.Increment(ref _activationCount);
+                if (count == 1)
+                    _logger.LogWarning(0, "SinkMode", $"Activated containment: {reason}");
+                else
+                    _logger.LogInfo(0, "SinkMode", $"Containment nested activation ({count}): {reason}");
+            }
+
+            return new ContainmentScope(this, reason);
         }
 
-        public void Deactivate(string reason)
+        private void EndContainment(string reason)
         {
-            Volatile.Write(ref _activeFlag, 0);
-            _logger.LogInfo(0, "SinkMode", $"Deactivated containment: {reason}");
+            int count = Interlocked.Decrement(ref _activationCount);
+            if (count < 0)
+            {
+                Interlocked.Exchange(ref _activationCount, 0);
+                _logger.LogWarning(0, "SinkMode", "Containment activation underflow detected; corrected to 0.");
+                return;
+            }
+
+            if (count == 0)
+                _logger.LogInfo(0, "SinkMode", $"Deactivated containment: {reason}");
         }
 
         private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -108,17 +146,46 @@ namespace USBGuardian
             _disposed = true;
 
             lock (_stateLock)
+
             {
                 if (_keyboardHook != IntPtr.Zero)
                 {
                     UnhookWindowsHookEx(_keyboardHook);
                     _keyboardHook = IntPtr.Zero;
                 }
+
                 if (_mouseHook != IntPtr.Zero)
                 {
                     UnhookWindowsHookEx(_mouseHook);
                     _mouseHook = IntPtr.Zero;
                 }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[SinkMode] Cleanup error: {ex.Message}");
+            }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(InputContainmentManager));
+        }
+
+        internal readonly struct ContainmentScope : IDisposable
+        {
+            private readonly InputContainmentManager? _owner;
+            private readonly string _reason;
+
+            public ContainmentScope(InputContainmentManager owner, string reason)
+            {
+                _owner = owner;
+                _reason = reason;
+            }
+
+            public void Dispose()
+            {
+                _owner?.EndContainment(_reason);
             }
         }
 
@@ -126,7 +193,10 @@ namespace USBGuardian
         private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll", SetLastError = true)]
-        private static extern IntPtr SetWindowsHookEx(int idHook, Delegate lpfn, IntPtr hMod, uint dwThreadId);
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
 
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -143,5 +213,6 @@ namespace USBGuardian
 
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
     }
 }
