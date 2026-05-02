@@ -119,6 +119,7 @@ namespace USBGuardian
         private readonly HashSet<string> _pendingDecisionKeys = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _lastDecisionPromptUtc = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, BlockedDeviceRecord> _temporaryDecisionBlocks = new(StringComparer.OrdinalIgnoreCase);
+        private readonly InputContainmentManager _inputContainment;
 
         public USBMessageWindow()
         {
@@ -158,6 +159,18 @@ namespace USBGuardian
                 guardianCore.EventLogger,
                 new AllowedDevicesBackupManager(),
                 dryRun: unblockManager.DryRun);
+
+            _inputContainment = new InputContainmentManager(guardianCore.EventLogger);
+            try
+            {
+                _inputContainment.InitializeHooks();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Startup] Input containment hook install failed: {ex.Message}");
+                guardianCore?.EventLogger?.LogWarning(0, "SinkMode", $"Hook install failed at startup: {ex.Message}");
+            }
+            Application.ApplicationExit += (_, _) => _inputContainment.Dispose();
 
             // Set up system tray icon with context menu
             SetupTrayIcon();
@@ -548,6 +561,7 @@ namespace USBGuardian
                 }
 
                 DeviceDecisionResult decisionResult;
+                using var containmentScope = _inputContainment.BeginContainment($"Decision prompt for {decisionKey}");
                 try
                 {
                     LogDecisionPipeline("PROMPT_SHOWN", decisionKey, currentDevice,
