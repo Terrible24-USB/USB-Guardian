@@ -92,6 +92,9 @@ namespace USBGuardian
         private const int DecisionPromptDebounceMs    = 1500;
         private const int DecisionDialogTimeoutSeconds = 20;
         private const int BalloonTipDurationMs         = 5000;
+        private const int RaceWindowFirstRecheckMs     = 250;
+        private const int RaceWindowSecondRecheckMs    = 750;
+        private const string TemporaryDecisionBlockReasonPrefix = "[TemporaryDecisionBlock]";
 
         private static readonly Guid GUID_DEVINTERFACE_USB_DEVICE =
             new Guid("A5DCBF10-6530-11D2-901F-00C04FB951ED");
