@@ -33,13 +33,17 @@ namespace USBGuardian
         public static DeviceDecisionResult ShowDecision(DeviceDecisionRequest request)
             => ShowDecision(request, 20);
 
-        public static DeviceDecisionResult ShowDecision(DeviceDecisionRequest request, int timeoutSeconds = 20)
+        public static DeviceDecisionResult ShowDecision(
+            DeviceDecisionRequest request,
+            int timeoutSeconds = 20,
+            Action<IntPtr>? onDialogShown = null,
+            Action<IntPtr>? onDialogClosed = null)
         {
             if (request == null) throw new ArgumentNullException(nameof(request));
             if (timeoutSeconds < 1) throw new ArgumentOutOfRangeException(nameof(timeoutSeconds));
 
             var result = new DeviceDecisionResult();
-            using var form = new Form
+            using var form = new DecisionForm
             {
                 Text = "USB Guardian - Device Decision Required",
                 Size = new Size(660, 500),
@@ -48,7 +52,8 @@ namespace USBGuardian
                 MaximizeBox = false,
                 MinimizeBox = false,
                 TopMost = true,
-                ShowInTaskbar = true
+                ShowInTaskbar = true,
+                KeyPreview = true
             };
             form.Shown += (_, _) =>
             {
@@ -57,8 +62,13 @@ namespace USBGuardian
                     form.WindowState = FormWindowState.Normal;
                     form.Activate();
                     form.BringToFront();
+                    onDialogShown?.Invoke(form.Handle);
                 }
                 catch { }
+            };
+            form.FormClosed += (_, _) =>
+            {
+                try { onDialogClosed?.Invoke(form.Handle); } catch { }
             };
 
             var txtDetails = new TextBox
@@ -68,7 +78,8 @@ namespace USBGuardian
                 Multiline = true,
                 ReadOnly = true,
                 ScrollBars = ScrollBars.Vertical,
-                Text = BuildDetailsText(request)
+                Text = BuildDetailsText(request),
+                TabStop = false
             };
 
             var chkNeverAsk = new CheckBox
@@ -79,73 +90,31 @@ namespace USBGuardian
                 Checked = false
             };
 
-            var btnAllow = new Button
+            var btnAllow = new Button { Text = "Allow Once", Location = new Point(20, 385), Size = new Size(140, 40), BackColor = Color.LightGreen };
+            btnAllow.Click += (_, _) => { result.Action = DeviceDecisionAction.AllowOnce; result.NeverAskAgain = chkNeverAsk.Checked; form.DialogResult = DialogResult.OK; form.Close(); };
+
+            var btnWhitelist = new Button { Text = "Allow & Whitelist", Location = new Point(175, 385), Size = new Size(140, 40), BackColor = Color.LightBlue };
+            btnWhitelist.Click += (_, _) => { result.Action = DeviceDecisionAction.AllowAndWhitelist; result.NeverAskAgain = true; form.DialogResult = DialogResult.Yes; form.Close(); };
+
+            var btnBlock = new Button { Text = "Block Device", Location = new Point(330, 385), Size = new Size(140, 40), BackColor = Color.LightCoral };
+            btnBlock.Click += (_, _) => { result.Action = DeviceDecisionAction.Block; result.NeverAskAgain = false; form.DialogResult = DialogResult.No; form.Close(); };
+
+            var btnIgnore = new Button { Text = "Ignore", Location = new Point(490, 385), Size = new Size(140, 40), BackColor = Color.Gainsboro };
+            btnIgnore.Click += (_, _) => { result.Action = DeviceDecisionAction.Ignore; result.NeverAskAgain = false; form.DialogResult = DialogResult.Cancel; form.Close(); };
+
+            form.BindShortcuts(btnAllow, btnWhitelist, btnBlock, btnIgnore);
+
+            var lblShortcuts = new Label
             {
-                Text = "Allow Once",
-                Location = new Point(20, 385),
-                Size = new Size(140, 40),
-                BackColor = Color.LightGreen
-            };
-            btnAllow.Click += (_, _) =>
-            {
-                result.Action = DeviceDecisionAction.AllowOnce;
-                result.NeverAskAgain = chkNeverAsk.Checked;
-                form.DialogResult = DialogResult.OK;
-                form.Close();
+                Text = "Shortcuts: A = Allow Once, W = Allow & Whitelist, B = Block, I = Ignore",
+                Location = new Point(20, 430),
+                Size = new Size(610, 22),
+                ForeColor = Color.DimGray
             };
 
-            var btnWhitelist = new Button
-            {
-                Text = "Allow & Whitelist",
-                Location = new Point(175, 385),
-                Size = new Size(140, 40),
-                BackColor = Color.LightBlue
-            };
-            btnWhitelist.Click += (_, _) =>
-            {
-                result.Action = DeviceDecisionAction.AllowAndWhitelist;
-                result.NeverAskAgain = true;
-                form.DialogResult = DialogResult.Yes;
-                form.Close();
-            };
+            form.Controls.AddRange(new Control[] { txtDetails, chkNeverAsk, btnAllow, btnWhitelist, btnBlock, btnIgnore, lblShortcuts });
 
-            var btnBlock = new Button
-            {
-                Text = "Block Device",
-                Location = new Point(330, 385),
-                Size = new Size(140, 40),
-                BackColor = Color.LightCoral
-            };
-            btnBlock.Click += (_, _) =>
-            {
-                result.Action = DeviceDecisionAction.Block;
-                result.NeverAskAgain = false;
-                form.DialogResult = DialogResult.No;
-                form.Close();
-            };
-
-            var btnIgnore = new Button
-            {
-                Text = "Ignore",
-                Location = new Point(490, 385),
-                Size = new Size(140, 40),
-                BackColor = Color.Gainsboro
-            };
-            btnIgnore.Click += (_, _) =>
-            {
-                result.Action = DeviceDecisionAction.Ignore;
-                result.NeverAskAgain = false;
-                form.DialogResult = DialogResult.Cancel;
-                form.Close();
-            };
-
-            form.Controls.AddRange(new Control[]
-            {
-                txtDetails, chkNeverAsk, btnAllow, btnWhitelist, btnBlock, btnIgnore
-            });
-
-            using var timeoutTimer = new System.Windows.Forms.Timer();
-            timeoutTimer.Interval = timeoutSeconds * 1000;
+            using var timeoutTimer = new Timer { Interval = timeoutSeconds * 1000 };
             timeoutTimer.Tick += (_, _) =>
             {
                 timeoutTimer.Stop();
@@ -158,6 +127,29 @@ namespace USBGuardian
             timeoutTimer.Start();
             form.ShowDialog();
             return result;
+        }
+
+        private sealed class DecisionForm : Form
+        {
+            private Button? _allow;
+            private Button? _whitelist;
+            private Button? _block;
+            private Button? _ignore;
+
+            public void BindShortcuts(Button allow, Button whitelist, Button block, Button ignore)
+            {
+                _allow = allow; _whitelist = whitelist; _block = block; _ignore = ignore;
+            }
+
+            protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+            {
+                Keys key = keyData & Keys.KeyCode;
+                if (key == Keys.A) { _allow?.PerformClick(); return true; }
+                if (key == Keys.W) { _whitelist?.PerformClick(); return true; }
+                if (key == Keys.B) { _block?.PerformClick(); return true; }
+                if (key == Keys.I) { _ignore?.PerformClick(); return true; }
+                return base.ProcessCmdKey(ref msg, keyData);
+            }
         }
 
         private static string BuildDetailsText(DeviceDecisionRequest request)
