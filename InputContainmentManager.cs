@@ -178,8 +178,9 @@ namespace USBGuardian
             if (nCode != HC_ACTION || !IsActive)
                 return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
 
-            int msg = wParam.ToInt32();
-            if (msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN)
+            // Always allow input to our own trusted window.
+            IntPtr fg = GetForegroundWindow();
+            if (IsTrustedContextWindow(fg))
                 return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
 
             var keyInfo = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
@@ -205,11 +206,14 @@ namespace USBGuardian
             if (nCode != HC_ACTION || !IsActive)
                 return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
 
-            // Strict containment mode: freeze all mouse movement/click input.
-            // User decisions are intentionally keyboard-only (A/W/B/I).
-            return (IntPtr)1;
-        }
+            IntPtr fg = GetForegroundWindow();
+            if (IsTrustedContextWindow(fg))
+                return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
 
+            var mouse = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+            IntPtr underCursor = WindowFromPoint(mouse.pt);
+            if (IsTrustedContextWindow(underCursor))
+                return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
 
         private static bool IsDangerousCombo(KBDLLHOOKSTRUCT keyInfo)
         {
@@ -230,7 +234,21 @@ namespace USBGuardian
             return false;
         }
 
+
         private bool IsTrustedContextWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            if (IsOwnedByCurrentProcess(hwnd)) return true;
+
+            IntPtr trusted;
+            lock (_stateLock) trusted = _trustedHwnd;
+            if (trusted == IntPtr.Zero) return false;
+
+            if (hwnd == trusted) return true;
+            return IsChild(trusted, hwnd);
+        }
+
+        private static bool IsOwnedByCurrentProcess(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero) return false;
 
@@ -265,17 +283,6 @@ namespace USBGuardian
             }
         }
 
-
-
-[StructLayout(LayoutKind.Sequential)]
-        private struct KBDLLHOOKSTRUCT
-        {
-            public uint vkCode;
-            public uint scanCode;
-            public uint flags;
-            public uint time;
-            public IntPtr dwExtraInfo;
-        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct INPUT
@@ -321,16 +328,5 @@ namespace USBGuardian
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-
-
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
-
-        [DllImport("user32.dll")]
-        private static extern short GetKeyState(int nVirtKey);
     }
 }
