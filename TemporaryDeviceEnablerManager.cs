@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -11,8 +12,15 @@ namespace USBGuardian
     {
         private readonly SecurityEventLogger _logger;
         private readonly DeviceWhitelistManager _whitelist;
-        private string? _enabledDeviceVidPid;
-        private DateTime? _enabledUntilUtc;
+        private readonly object _lock = new();
+        private readonly Dictionary<string, TemporaryEnableWindow> _enabledDevices = new(StringComparer.OrdinalIgnoreCase);
+        private long _enableToken;
+
+        private sealed class TemporaryEnableWindow
+        {
+            public DateTime ExpiresUtc { get; set; }
+            public long Token { get; set; }
+        }
 
         [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
         private static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string? pDeviceID, uint ulFlags);
@@ -56,8 +64,17 @@ namespace USBGuardian
                 TriggerDeviceRescan();
                 Thread.Sleep(500);
 
-                _enabledDeviceVidPid = vidPid;
-                _enabledUntilUtc = DateTime.UtcNow.AddSeconds(enableDurationSeconds);
+                DateTime expiresUtc = DateTime.UtcNow.AddSeconds(enableDurationSeconds);
+                long token;
+                lock (_lock)
+                {
+                    token = ++_enableToken;
+                    _enabledDevices[vidPid] = new TemporaryEnableWindow
+                    {
+                        ExpiresUtc = expiresUtc,
+                        Token = token
+                    };
+                }
                 _logger.LogPreBootAction("TemporaryEnable",
                     $"USB storage temporarily enabled for {vidPid} for {enableDurationSeconds}s.", SecuritySeverity.Warning, vidPid);
 
@@ -66,15 +83,24 @@ namespace USBGuardian
                     try
                     {
                         await Task.Delay(TimeSpan.FromSeconds(enableDurationSeconds)).ConfigureAwait(false);
-                        if (!string.Equals(_enabledDeviceVidPid, vidPid, StringComparison.OrdinalIgnoreCase))
-                            return;
+                        bool expired = false;
+                        lock (_lock)
+                        {
+                            if (_enabledDevices.TryGetValue(vidPid, out TemporaryEnableWindow window) &&
+                                window.Token == token)
+                            {
+                                _enabledDevices.Remove(vidPid);
+                                expired = true;
+                            }
+                        }
 
-                        _enabledDeviceVidPid = null;
-                        _enabledUntilUtc = null;
-                        _logger.LogPreBootAction("TemporaryEnable",
-                            $"Temporary USB storage window expired for {vidPid}. No persistent pre-boot block re-applied.",
-                            SecuritySeverity.Warning,
-                            vidPid);
+                        if (expired)
+                        {
+                            _logger.LogPreBootAction("TemporaryEnable",
+                                $"Temporary USB storage window expired for {vidPid}. No persistent pre-boot block re-applied.",
+                                SecuritySeverity.Warning,
+                                vidPid);
+                        }
                     }
                     catch (Exception delayedEx)
                     {
@@ -104,8 +130,19 @@ namespace USBGuardian
         public bool IsTemporaryWindowActive(string vidPid)
         {
             if (string.IsNullOrWhiteSpace(vidPid)) return false;
-            if (!string.Equals(_enabledDeviceVidPid, vidPid, StringComparison.OrdinalIgnoreCase)) return false;
-            return _enabledUntilUtc.HasValue && _enabledUntilUtc.Value > DateTime.UtcNow;
+            lock (_lock)
+            {
+                if (!_enabledDevices.TryGetValue(vidPid, out TemporaryEnableWindow window))
+                    return false;
+
+                if (window.ExpiresUtc <= DateTime.UtcNow)
+                {
+                    _enabledDevices.Remove(vidPid);
+                    return false;
+                }
+
+                return true;
+            }
         }
 
         private void ClearConfigFlagsForVidPid(string vidPid)
