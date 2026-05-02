@@ -87,8 +87,7 @@ namespace USBGuardian
                         lock (_lock)
                         {
                             if (_enabledDevices.TryGetValue(vidPid, out TemporaryEnableWindow window) &&
-                                window.Token == token &&
-                                window.ExpiresUtc <= DateTime.UtcNow)
+                                window.Token == token)
                             {
                                 _enabledDevices.Remove(vidPid);
                                 expired = true;

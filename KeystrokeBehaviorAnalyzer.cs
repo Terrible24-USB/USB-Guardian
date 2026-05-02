@@ -207,12 +207,7 @@ namespace USBGuardian
                 return;
 
             DateTime cutoff = currentTimestamp - KeystrokeHistoryWindow;
-            int cutoffIndex = timestamps.BinarySearch(cutoff);
-            if (cutoffIndex < 0)
-                cutoffIndex = ~cutoffIndex;
-
-            if (cutoffIndex > 0)
-                timestamps.RemoveRange(0, cutoffIndex);
+            timestamps.RemoveAll(t => t < cutoff);
 
             if (timestamps.Count > MaxKeystrokeSamples)
                 timestamps.RemoveRange(0, timestamps.Count - MaxKeystrokeSamples);
