@@ -712,14 +712,28 @@ namespace USBGuardian
 
             try
             {
+                InputContainmentManager.TrustedWindowScope? trustedWindowScope = null;
+
+                Action<IntPtr> onShown = hwnd =>
+                {
+                    trustedWindowScope?.Dispose();
+                    trustedWindowScope = _inputContainment.BeginTrustedWindowScope(hwnd);
+                };
+
+                Action<IntPtr> onClosed = _ =>
+                {
+                    trustedWindowScope?.Dispose();
+                    trustedWindowScope = null;
+                };
+
                 if (SynchronizationContext.Current == _uiContext ||
                     Thread.CurrentThread.ManagedThreadId == _uiThreadId)
-                    return DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds);
+                    return DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds, onShown, onClosed);
 
                 DeviceDecisionResult decision = new() { Action = DeviceDecisionAction.Block };
                 _uiContext.Send(_ =>
                 {
-                    decision = DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds);
+                    decision = DeviceDecisionDialog.ShowDecision(request, DecisionDialogTimeoutSeconds, onShown, onClosed);
                 }, null);
                 return decision;
             }
