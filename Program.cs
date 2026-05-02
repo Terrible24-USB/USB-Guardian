@@ -119,6 +119,7 @@ namespace USBGuardian
         private readonly HashSet<string> _pendingDecisionKeys = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> _lastDecisionPromptUtc = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, BlockedDeviceRecord> _temporaryDecisionBlocks = new(StringComparer.OrdinalIgnoreCase);
+        private readonly InputContainmentManager _inputContainment;
 
         public USBMessageWindow()
         {
@@ -158,6 +159,10 @@ namespace USBGuardian
                 guardianCore.EventLogger,
                 new AllowedDevicesBackupManager(),
                 dryRun: unblockManager.DryRun);
+
+            _inputContainment = new InputContainmentManager(guardianCore.EventLogger);
+            _inputContainment.InitializeHooks();
+            Application.ApplicationExit += (_, _) => _inputContainment.Dispose();
 
             // Set up system tray icon with context menu
             SetupTrayIcon();
@@ -548,6 +553,7 @@ namespace USBGuardian
                 }
 
                 DeviceDecisionResult decisionResult;
+                _inputContainment.Activate($"Decision prompt for {decisionKey}");
                 try
                 {
                     LogDecisionPipeline("PROMPT_SHOWN", decisionKey, currentDevice,
@@ -556,6 +562,7 @@ namespace USBGuardian
                 }
                 finally
                 {
+                    _inputContainment.Deactivate($"Decision prompt closed for {decisionKey}");
                     EndDecisionPrompt(decisionKey);
                 }
 
