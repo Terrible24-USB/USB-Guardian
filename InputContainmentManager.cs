@@ -3,7 +3,6 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
-using System.Collections.Generic;
 
 namespace USBGuardian
 {
@@ -25,20 +24,17 @@ namespace USBGuardian
 
         private int _activationCount;
         private bool _disposed;
-        private readonly HashSet<IntPtr> _trustedWindows = new();
 
         private static readonly int CurrentProcessId = Process.GetCurrentProcess().Id;
 
         private const int WH_KEYBOARD_LL = 13;
         private const int WH_MOUSE_LL = 14;
         private const int HC_ACTION = 0;
-
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_KEYUP = 0x0101;
         private const int WM_SYSKEYDOWN = 0x0104;
-        private const int WM_SYSKEYUP = 0x0105;
 
-        public bool IsActive => Volatile.Read(ref _activationCount) > 0;
+        public bool IsActive => Volatile.Read(ref _activeFlag) == 1;
 
         public InputContainmentManager(SecurityEventLogger logger)
         {
@@ -96,24 +92,6 @@ namespace USBGuardian
             return new ContainmentScope(this, reason);
         }
 
-
-        public TrustedWindowScope BeginTrustedWindowScope(IntPtr hwnd)
-        {
-            lock (_stateLock)
-            {
-                if (hwnd != IntPtr.Zero)
-                    _trustedWindows.Add(hwnd);
-            }
-            return new TrustedWindowScope(this, hwnd);
-        }
-
-        private void RemoveTrustedWindow(IntPtr hwnd)
-        {
-            if (hwnd == IntPtr.Zero) return;
-            lock (_stateLock)
-                _trustedWindows.Remove(hwnd);
-        }
-
         private void EndContainment(string reason)
         {
             int count = Interlocked.Decrement(ref _activationCount);
@@ -130,62 +108,45 @@ namespace USBGuardian
 
         private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode == HC_ACTION && IsActive && !IsTrustedUiForeground())
-            {
-                int msg = wParam.ToInt32();
-                if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)
-                    return (IntPtr)1;
-            }
+            if (nCode != HC_ACTION || !IsActive)
+                return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+
+            // Allow interaction with the guardian's own decision UI while still
+            // blocking input to other processes/windows.
+            if (!IsForegroundOwnedByCurrentProcess())
+                return (IntPtr)1;
 
             return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
         }
 
         private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode == HC_ACTION && IsActive && !IsTrustedUiForeground())
+            if (nCode != HC_ACTION || !IsActive)
+                return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+
+            if (!IsForegroundOwnedByCurrentProcess())
                 return (IntPtr)1;
 
             return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
         }
 
-        private bool IsTrustedUiForeground()
+        private static bool IsForegroundOwnedByCurrentProcess()
         {
-            IntPtr hwnd = GetForegroundWindow();
-            if (hwnd == IntPtr.Zero)
+            IntPtr fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero)
                 return false;
 
-            _ = GetWindowThreadProcessId(hwnd, out uint pid);
-            if (pid == (uint)CurrentProcessId)
-                return true;
-
-            lock (_stateLock)
-            {
-                foreach (IntPtr trusted in _trustedWindows)
-                {
-                    if (trusted == IntPtr.Zero) continue;
-                    if (hwnd == trusted || IsChild(trusted, hwnd))
-                        return true;
-                }
-            }
-
-            return false;
+            _ = GetWindowThreadProcessId(fg, out uint pid);
+            return pid == (uint)Environment.ProcessId;
         }
 
         public void Dispose()
         {
             if (_disposed) return;
-            lock (_stateLock)
-            {
-                if (_disposed) return;
-                _disposed = true;
-                Interlocked.Exchange(ref _activationCount, 0);
-                CleanupHooks_NoThrow();
-            }
-        }
+            _disposed = true;
 
-        private void CleanupHooks_NoThrow()
-        {
-            try
+            lock (_stateLock)
+
             {
                 if (_keyboardHook != IntPtr.Zero)
                 {
@@ -228,23 +189,6 @@ namespace USBGuardian
             }
         }
 
-        internal readonly struct TrustedWindowScope : IDisposable
-        {
-            private readonly InputContainmentManager? _owner;
-            private readonly IntPtr _hwnd;
-
-            public TrustedWindowScope(InputContainmentManager owner, IntPtr hwnd)
-            {
-                _owner = owner;
-                _hwnd = hwnd;
-            }
-
-            public void Dispose()
-            {
-                _owner?.RemoveTrustedWindow(_hwnd);
-            }
-        }
-
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
         private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -261,17 +205,14 @@ namespace USBGuardian
         [DllImport("user32.dll")]
         private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern IntPtr GetModuleHandle(string? lpModuleName);
-
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
 
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
         [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
     }
 }

@@ -112,7 +112,43 @@ namespace USBGuardian
                 ForeColor = Color.DimGray
             };
 
-            form.Controls.AddRange(new Control[] { txtDetails, chkNeverAsk, btnAllow, btnWhitelist, btnBlock, btnIgnore, lblShortcuts });
+
+            var lblShortcuts = new Label
+            {
+                Text = "Shortcuts: A = Allow Once, W = Allow & Whitelist, B = Block, I = Ignore",
+                Location = new Point(20, 430),
+                Size = new Size(610, 22),
+                ForeColor = Color.DimGray
+            };
+
+            form.KeyDown += (_, e) =>
+            {
+                if (e.KeyCode == Keys.A)
+                {
+                    btnAllow.PerformClick();
+                    e.Handled = true;
+                }
+                else if (e.KeyCode == Keys.W)
+                {
+                    btnWhitelist.PerformClick();
+                    e.Handled = true;
+                }
+                else if (e.KeyCode == Keys.B)
+                {
+                    btnBlock.PerformClick();
+                    e.Handled = true;
+                }
+                else if (e.KeyCode == Keys.I)
+                {
+                    btnIgnore.PerformClick();
+                    e.Handled = true;
+                }
+            };
+
+            form.Controls.AddRange(new Control[]
+            {
+                txtDetails, chkNeverAsk, btnAllow, btnWhitelist, btnBlock, btnIgnore, lblShortcuts
+            });
 
             using var timeoutTimer = new Timer { Interval = timeoutSeconds * 1000 };
             timeoutTimer.Tick += (_, _) =>

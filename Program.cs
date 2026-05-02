@@ -570,6 +570,7 @@ namespace USBGuardian
                 }
                 finally
                 {
+                    _inputContainment.Deactivate($"Decision prompt closed for {decisionKey}");
                     EndDecisionPrompt(decisionKey);
                 }
 
