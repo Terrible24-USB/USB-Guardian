@@ -41,6 +41,7 @@ namespace USBGuardian
         private LowLevelMouseProc? _mouseProc;
         private IntPtr _trustedHwnd = IntPtr.Zero;
         private int _activeFlag;
+        private bool _hooksInstalled;
         private bool _disposed;
 
         public bool IsActive => Volatile.Read(ref _activeFlag) == 1;
@@ -50,29 +51,16 @@ namespace USBGuardian
             _logger = logger;
         }
 
-        public void InitializeHooks()
-        {
-            lock (_stateLock)
-            {
-                ThrowIfDisposed();
-                if (_keyboardHook != IntPtr.Zero) return;
-
-                _keyboardProc = KeyboardHookCallback;
-                _mouseProc = MouseHookCallback;
-
-                _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, GetModuleHandle(null), 0);
-                _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, GetModuleHandle(null), 0);
-
-                if (_keyboardHook == IntPtr.Zero || _mouseHook == IntPtr.Zero)
-                    _logger.LogWarning(0, "InputContainment",
-                        $"Low-level hook install failed (Win32={Marshal.GetLastWin32Error()}).");
-                else
-                    _logger.LogInfo(0, "InputContainment", "Low-level hooks installed.");
-            }
-        }
-
         public void Activate(string reason)
         {
+            EnsureHooksInstalled();
+            if (!_hooksInstalled)
+            {
+                _logger.LogWarning(0, "InputContainment", $"Activation skipped because hooks are not installed: {reason}");
+                return;
+            }
+
+            FlushPendingInputState();
             Volatile.Write(ref _activeFlag, 1);
             _logger.LogInfo(0, "InputContainment", $"Activated: {reason}");
         }
@@ -81,7 +69,72 @@ namespace USBGuardian
         {
             Volatile.Write(ref _activeFlag, 0);
             lock (_stateLock) _trustedHwnd = IntPtr.Zero;
+            ReleaseHooks();
             _logger.LogInfo(0, "InputContainment", $"Deactivated: {reason}");
+        }
+
+        private void EnsureHooksInstalled()
+        {
+            lock (_stateLock)
+            {
+                ThrowIfDisposed();
+                if (_hooksInstalled) return;
+
+                _keyboardProc = KeyboardHookCallback;
+                _mouseProc = MouseHookCallback;
+
+                _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, GetModuleHandle(null), 0);
+                _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, GetModuleHandle(null), 0);
+
+                if (_keyboardHook == IntPtr.Zero || _mouseHook == IntPtr.Zero)
+                {
+                    _logger.LogWarning(0, "InputContainment",
+                        $"Low-level hook install failed (Win32={Marshal.GetLastWin32Error()}).");
+                    if (_keyboardHook != IntPtr.Zero) { UnhookWindowsHookEx(_keyboardHook); _keyboardHook = IntPtr.Zero; }
+                    if (_mouseHook != IntPtr.Zero) { UnhookWindowsHookEx(_mouseHook); _mouseHook = IntPtr.Zero; }
+                    _hooksInstalled = false;
+                    return;
+                }
+
+                _hooksInstalled = true;
+                _logger.LogInfo(0, "InputContainment", "Low-level hooks installed.");
+            }
+        }
+
+        private void ReleaseHooks()
+        {
+            lock (_stateLock)
+            {
+                if (!_hooksInstalled || _activeFlag == 1) return;
+
+                if (_keyboardHook != IntPtr.Zero) { UnhookWindowsHookEx(_keyboardHook); _keyboardHook = IntPtr.Zero; }
+                if (_mouseHook != IntPtr.Zero) { UnhookWindowsHookEx(_mouseHook); _mouseHook = IntPtr.Zero; }
+                _hooksInstalled = false;
+                _logger.LogInfo(0, "InputContainment", "Low-level hooks removed.");
+            }
+        }
+
+        private void FlushPendingInputState()
+        {
+            var releases = new[] { 0x5B, 0x5C, 0x11, 0x12, 0x10, 0x1B };
+            INPUT[] inputs = new INPUT[releases.Length];
+            for (int i = 0; i < releases.Length; i++)
+            {
+                inputs[i] = new INPUT
+                {
+                    type = 1,
+                    U = new INPUTUNION
+                    {
+                        ki = new KEYBDINPUT
+                        {
+                            wVk = (ushort)releases[i],
+                            dwFlags = 0x0002
+                        }
+                    }
+                };
+            }
+
+            _ = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
         }
 
         // ── TrustedWindowScope ───────────────────────────────────────────────────────
@@ -112,14 +165,6 @@ namespace USBGuardian
             }
         }
 
-        internal readonly struct ContainmentScope : IDisposable
-        {
-            private readonly InputContainmentManager? _owner;
-            private readonly string _reason;
-            public ContainmentScope(InputContainmentManager owner, string reason)
-            { _owner = owner; _reason = reason; }
-            public void Dispose() => _owner?.Deactivate(_reason);
-        }
 
         // ── hook callbacks ───────────────────────────────────────────────────────────
 
@@ -130,7 +175,7 @@ namespace USBGuardian
 
             // Always allow input to our own trusted window.
             IntPtr fg = GetForegroundWindow();
-            if (fg != IntPtr.Zero && (fg == _trustedHwnd || IsOwnedByCurrentProcess(fg)))
+            if (IsTrustedContextWindow(fg))
                 return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
 
             // Whitelist: only let through keys needed for the decision dialog.
@@ -152,10 +197,29 @@ namespace USBGuardian
                 return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
 
             IntPtr fg = GetForegroundWindow();
-            if (fg != IntPtr.Zero && (fg == _trustedHwnd || IsOwnedByCurrentProcess(fg)))
+            if (IsTrustedContextWindow(fg))
+                return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+
+            var mouse = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+            IntPtr underCursor = WindowFromPoint(mouse.pt);
+            if (IsTrustedContextWindow(underCursor))
                 return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
 
             return (IntPtr)1; // block
+        }
+
+
+        private bool IsTrustedContextWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            if (IsOwnedByCurrentProcess(hwnd)) return true;
+
+            IntPtr trusted;
+            lock (_stateLock) trusted = _trustedHwnd;
+            if (trusted == IntPtr.Zero) return false;
+
+            if (hwnd == trusted) return true;
+            return IsChild(trusted, hwnd);
         }
 
         private static bool IsOwnedByCurrentProcess(IntPtr hwnd)
@@ -182,6 +246,48 @@ namespace USBGuardian
             }
         }
 
+
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int x;
+            public int y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSLLHOOKSTRUCT
+        {
+            public POINT pt;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct INPUT
+        {
+            public uint type;
+            public INPUTUNION U;
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        private struct INPUTUNION
+        {
+            [FieldOffset(0)] public KEYBDINPUT ki;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KEYBDINPUT
+        {
+            public ushort wVk;
+            public ushort wScan;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
         private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -203,5 +309,15 @@ namespace USBGuardian
 
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(POINT pt);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
     }
 }
