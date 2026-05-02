@@ -9,6 +9,7 @@ namespace USBGuardian
     {
         public string DeviceVidPid { get; set; } = string.Empty;
         public DateTime StartTime { get; set; } = DateTime.UtcNow;
+        public DateTime LastActivityUtc { get; set; } = DateTime.UtcNow;
         public List<DateTime> KeystrokeTimestamps { get; set; } = new();
         public List<string> SuspiciousCommands { get; set; } = new();
     }
@@ -27,6 +28,9 @@ namespace USBGuardian
         private readonly SecurityEventLogger _logger;
         private readonly Dictionary<string, KeystrokeSession> _sessions = new();
         private readonly object _lock = new();
+        private static readonly TimeSpan IdleSessionThreshold = TimeSpan.FromHours(2);
+        private static readonly TimeSpan KeystrokeHistoryWindow = TimeSpan.FromMinutes(5);
+        private const int MaxKeystrokeSamples = 2000;
 
         private static readonly List<string> SuspiciousPatterns = new()
         {
@@ -44,7 +48,12 @@ namespace USBGuardian
         {
             lock (_lock)
             {
-                _sessions[vidPid] = new KeystrokeSession { DeviceVidPid = vidPid };
+                PruneIdleSessions(DateTime.UtcNow);
+                _sessions[vidPid] = new KeystrokeSession
+                {
+                    DeviceVidPid = vidPid,
+                    LastActivityUtc = DateTime.UtcNow
+                };
                 _logger.LogInfo(3, "BehaviorMonitor", $"Started keystroke monitoring for {vidPid}", vidPid);
             }
         }
@@ -53,8 +62,11 @@ namespace USBGuardian
         {
             lock (_lock)
             {
-                if (!_sessions.TryGetValue(vidPid, out var session)) return;
+                PruneIdleSessions(DateTime.UtcNow);
+                var session = GetOrCreateSession(vidPid);
+                session.LastActivityUtc = DateTime.UtcNow;
                 session.KeystrokeTimestamps.Add(timestamp);
+                TrimKeystrokeHistory(session, timestamp);
             }
         }
 
@@ -62,7 +74,9 @@ namespace USBGuardian
         {
             lock (_lock)
             {
-                if (!_sessions.TryGetValue(vidPid, out var session)) return;
+                PruneIdleSessions(DateTime.UtcNow);
+                var session = GetOrCreateSession(vidPid);
+                session.LastActivityUtc = DateTime.UtcNow;
 
                 // Scan for suspicious command patterns (primary purpose of RecordText)
                 string lower = text.ToLowerInvariant();
@@ -82,6 +96,7 @@ namespace USBGuardian
             KeystrokeSession? session;
             lock (_lock)
             {
+                PruneIdleSessions(DateTime.UtcNow);
                 _sessions.TryGetValue(vidPid, out session);
             }
 
@@ -146,6 +161,55 @@ namespace USBGuardian
                 _logger.LogInfo(3, "BehaviorMonitor", $"Stopped keystroke monitoring for {vidPid}", vidPid);
             }
             return result;
+        }
+
+        private KeystrokeSession GetOrCreateSession(string vidPid)
+        {
+            if (_sessions.TryGetValue(vidPid, out var session))
+                return session;
+
+            session = new KeystrokeSession
+            {
+                DeviceVidPid = vidPid,
+                LastActivityUtc = DateTime.UtcNow
+            };
+            _sessions[vidPid] = session;
+            _logger.LogInfo(3, "BehaviorMonitor", $"Auto-started keystroke monitoring for {vidPid}", vidPid);
+            return session;
+        }
+
+        private void PruneIdleSessions(DateTime nowUtc)
+        {
+            var stale = new List<string>();
+            foreach (var entry in _sessions)
+            {
+                if (nowUtc - entry.Value.LastActivityUtc > IdleSessionThreshold)
+                    stale.Add(entry.Key);
+            }
+
+            foreach (string key in stale)
+            {
+                _sessions.Remove(key);
+                _logger.LogInfo(3, "BehaviorMonitor", $"Pruned idle keystroke session for {key}", key);
+            }
+        }
+
+        private static void TrimKeystrokeHistory(KeystrokeSession session, DateTime currentTimestamp)
+        {
+            var timestamps = session.KeystrokeTimestamps;
+            if (timestamps.Count == 0)
+                return;
+
+            DateTime cutoff = currentTimestamp - KeystrokeHistoryWindow;
+            int removeCount = 0;
+            while (removeCount < timestamps.Count && timestamps[removeCount] < cutoff)
+                removeCount++;
+
+            if (removeCount > 0)
+                timestamps.RemoveRange(0, removeCount);
+
+            if (timestamps.Count > MaxKeystrokeSamples)
+                timestamps.RemoveRange(0, timestamps.Count - MaxKeystrokeSamples);
         }
     }
 }

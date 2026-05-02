@@ -79,6 +79,18 @@ namespace USBGuardian
             }
         }
 
+        public void StartKeystrokeMonitoring(string vidPid)
+        {
+            try
+            {
+                _securityEngine.StartKeystrokeMonitoring(vidPid);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[UsbGuardianCore] StartKeystrokeMonitoring failed for {vidPid}: {ex.Message}");
+            }
+        }
+
         public BlockingResult HandleThreat(DeviceFingerprint device, DeviceEvaluationResult evaluationResult)
         {
             var blockResult = new BlockingResult();

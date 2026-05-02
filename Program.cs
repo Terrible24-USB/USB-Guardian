@@ -125,7 +125,7 @@ namespace USBGuardian
             _uiThreadId = Thread.CurrentThread.ManagedThreadId;
             // Create a hidden control for reliable cross-thread UI marshaling (Control.Invoke).
             _invokeTarget = new Control();
-            _invokeTarget.CreateHandle();
+            _invokeTarget.CreateControl();
 
             try
             {
