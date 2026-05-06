@@ -18,18 +18,28 @@ namespace USBGuardian
 
         private static readonly Dictionary<byte, string> BlockedClasses = new()
         {
+            { 0x01, "Audio" },
+            { 0x02, "CDC/Modem" },
+            { 0x03, "HID (Human Interface Device)" },
+            { 0x05, "Physical Interface" },
+            { 0x06, "Image/Scanner" },
+            { 0x07, "Printer" },
             { 0x08, "Mass Storage" },
             { 0x09, "Hub" },
-            { 0xFF, "Vendor-Specific" },
-            { 0x02, "CDC/Modem" },
-            { 0x07, "Printer" },
-            { 0x01, "Audio" },
+            { 0x0A, "CDC-Data" },
+            { 0x0B, "Smart Card" },
+            { 0x0E, "Video" },
+            { 0x10, "Audio/Video" },
+            { 0xDC, "Diagnostic" },
             { 0xE0, "Wireless" },
-            { 0xEF, "Composite" }
+            { 0xEF, "Composite" },
+            { 0xFF, "Vendor-Specific" }
         };
 
-        private static readonly HashSet<string> CriticalClasses = new() { "09", "FF" };
-        private static readonly HashSet<string> HighThreatClasses = new() { "08", "02", "07", "01", "E0", "EF" };
+        // Critical = block immediately, no prompt
+        private static readonly HashSet<string> CriticalClasses = new() { "03", "09", "FF", "E0", "EF" };
+        // High = block, log attack
+        private static readonly HashSet<string> HighThreatClasses = new() { "08", "02", "07", "01", "05", "06", "0A", "0B", "0E", "10", "DC" };
 
         // Whitelisted VID:PID pairs (e.g., "046D:C52B" for Logitech Unifying Receiver)
         private static readonly HashSet<string> WhitelistedVidPids = new(StringComparer.OrdinalIgnoreCase)
@@ -101,14 +111,6 @@ namespace USBGuardian
                     result.ThreatLevel = ThreatLevel.High;
                     result.Reason = $"Device class 0x{clsHex} ({highName}) is blocked at High threat level";
                     _logger.LogCritical(2, "ClassBlock", result.Reason, vidPid);
-                }
-                else if (cls == 0x03)
-                {
-                    // HID: flag but don't auto-block
-                    result.ShouldBlock = false;
-                    result.ThreatLevel = ThreatLevel.Medium;
-                    result.Reason = "HID device detected — not auto-blocked but flagged for monitoring";
-                    _logger.LogWarning(2, "ClassBlock", $"HID device {vidPid} flagged for monitoring", vidPid);
                 }
                 else
                 {

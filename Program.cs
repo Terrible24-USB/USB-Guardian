@@ -192,6 +192,12 @@ namespace USBGuardian
                     $"Disk arrival guard registration failed: {ex.Message}");
             }
             Application.ApplicationExit += (_, _) => _diskArrivalGuard.Dispose();
+
+            // MUST run before _pnpGuard.Register() so the snapshot is ready when
+            // the first PnP arrival fires.  Any HID device already loaded at this
+            // point is trusted and will be allowed silently by OnPnpDeviceArrived.
+            SnapshotPreExistingHidDevices();
+
             try
             {
                 _pnpGuard.Register();
@@ -414,6 +420,14 @@ namespace USBGuardian
         private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool>
             _pnpFrozenInstances = new(StringComparer.OrdinalIgnoreCase);
 
+        // Snapshot of ALL HID device instance IDs that were already connected when the
+        // app started.  These are "pre-existing trusted" devices: they were loaded and
+        // working before USB Guardian ran, so blocking them would lock the user out.
+        // Populated ONCE at startup (before PnpDeviceGuard.Register), never cleared.
+        // Match is by full instance ID (not just VID:PID) to handle the edge case where
+        // a laptop trackpad and an external mouse share the same VID:PID.
+        private HashSet<string> _preExistingHidInstances = new(StringComparer.OrdinalIgnoreCase);
+
         /// <summary>
         /// Called by PnpDeviceGuard ~10-30ms after USB insertion, before the HID
         /// driver finishes loading.  We immediately disable the device node so that
@@ -447,7 +461,23 @@ namespace USBGuardian
                 string instanceId = SymbolicLinkToInstanceId(symbolicLink);
                 if (string.IsNullOrWhiteSpace(instanceId)) return;
 
-                // Quick registry service read to decide whether to activate EarlyComboBlock.
+                // ── PRE-EXISTING HID SAFE-LIST ────────────────────────────────────
+                // If this device was already connected when the app started it is
+                // trusted by definition — it was loaded and working before USB
+                // Guardian had any say.  Skip ALL blocking for it.
+                // Match by full instance ID (not VID:PID) so a laptop trackpad and
+                // external mouse that share a VID:PID are distinguished correctly.
+                // Devices with ACPI\, ROOT\, SWD\ instance IDs are also implicitly
+                // covered because their instance IDs are snapshotted at startup.
+                if (_preExistingHidInstances.Contains(instanceId))
+                {
+                    _pnpEarlyApprovedInstances[instanceId] = true;
+                    guardianCore?.EventLogger?.LogInfo(0, "PnpGuard",
+                        $"Pre-existing HID device — allowed without freeze: {instanceId}");
+                    Debug.WriteLine($"[PnpGuard] Pre-existing safe-list match — skipped: {instanceId}");
+                    return;
+                }
+                // ── END PRE-EXISTING HID SAFE-LIST ───────────────────────────────
                 // Fails silently — if we can't read the key, err on the side of activating
                 // the block (better to temporarily restrict combos than miss a Ducky).
                 bool activateComboBlock = true; // default: block (fail-closed for HID threat)
@@ -461,15 +491,15 @@ namespace USBGuardian
                         string svc = regKey.GetValue("Service")?.ToString();
                         // Only HID services can inject keystrokes. Storage/hub devices cannot.
                         bool isHidService =
-                            string.Equals(svc, "kbdhid",   StringComparison.OrdinalIgnoreCase) ||
-                            string.Equals(svc, "mouhid",   StringComparison.OrdinalIgnoreCase) ||
-                            string.Equals(svc, "hidusb",   StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "kbdhid", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "mouhid", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "hidusb", StringComparison.OrdinalIgnoreCase) ||
                             string.Equals(svc, "kbdclass", StringComparison.OrdinalIgnoreCase) ||
                             string.Equals(svc, "mouclass", StringComparison.OrdinalIgnoreCase);
                         bool isStorageOrHubService =
                             string.Equals(svc, "usbstor", StringComparison.OrdinalIgnoreCase) ||
-                            string.Equals(svc, "disk",    StringComparison.OrdinalIgnoreCase) ||
-                            string.Equals(svc, "USBHUB",  StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "disk", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "USBHUB", StringComparison.OrdinalIgnoreCase) ||
                             string.Equals(svc, "USBHUB3", StringComparison.OrdinalIgnoreCase);
 
                         if (isStorageOrHubService)
@@ -2021,6 +2051,91 @@ namespace USBGuardian
         /// Creates placeholder whitelist entries for known built-in device types so they are
         /// never shown in the unknown-device dialog on first boot.
         /// </summary>
+        /// <summary>
+        /// Captures ALL currently connected HID device instance IDs at app startup.
+        /// Called ONCE before PnpDeviceGuard.Register() so the snapshot is ready for
+        /// the first PnP arrival event.  Any device in this set is treated as
+        /// "pre-existing trusted" by OnPnpDeviceArrived and never blocked/frozen.
+        ///
+        /// Strategy (per hid.md):
+        ///   1. Enumerate SYSTEM\CurrentControlSet\Enum\USB → all USB devices.
+        ///   2. For each instance, read Service value.
+        ///   3. HID services (kbdhid, mouhid, hidusb, kbdclass, mouclass) → add to set.
+        ///   4. ALSO enumerate SYSTEM\CurrentControlSet\Enum\HID for HID-bus children
+        ///      (many internal trackpads appear here, not under USB\).
+        ///   5. Auto-whitelist ACPI\, ROOT\, SWD\ prefixes unconditionally — these are
+        ///      never USB and must never be blocked.
+        /// </summary>
+        private void SnapshotPreExistingHidDevices()
+        {
+            var snapshot = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // HID services that can send keyboard / mouse input
+            var hidServices = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "kbdhid", "mouhid", "hidusb", "kbdclass", "mouclass", "i8042prt"
+            };
+
+            // Instance ID prefixes that are ALWAYS internal (never USB)
+            string[] builtInPrefixes = { "ACPI\\", "ROOT\\", "SWD\\", "HID\\VID_ACPI", "PCI\\" };
+
+            void ScanEnumKey(string rootPath)
+            {
+                try
+                {
+                    using var root = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(rootPath, writable: false);
+                    if (root == null) return;
+
+                    foreach (string vidFolder in root.GetSubKeyNames())
+                    {
+                        using var vidKey = root.OpenSubKey(vidFolder, writable: false);
+                        if (vidKey == null) continue;
+
+                        foreach (string instanceFolder in vidKey.GetSubKeyNames())
+                        {
+                            using var instKey = vidKey.OpenSubKey(instanceFolder, writable: false);
+                            if (instKey == null) continue;
+
+                            // Build the canonical instance ID: e.g. "USB\VID_046D&PID_C534\6&..."
+                            string instanceId = $"{vidFolder}\\{instanceFolder}";
+
+                            // Auto-include by built-in prefix (ACPI, ROOT, SWD, PCI)
+                            bool isBuiltInPrefix = builtInPrefixes.Any(p =>
+                                instanceId.StartsWith(p, StringComparison.OrdinalIgnoreCase));
+
+                            if (isBuiltInPrefix)
+                            {
+                                snapshot.Add(instanceId);
+                                Debug.WriteLine($"[PreExistingHID] Built-in prefix: {instanceId}");
+                                continue;
+                            }
+
+                            // Include if service is a HID input service
+                            string svc = instKey.GetValue("Service")?.ToString();
+                            if (!string.IsNullOrEmpty(svc) && hidServices.Contains(svc))
+                            {
+                                snapshot.Add(instanceId);
+                                Debug.WriteLine($"[PreExistingHID] HID service '{svc}': {instanceId}");
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[PreExistingHID] Scan of '{rootPath}' failed: {ex.Message}");
+                }
+            }
+
+            ScanEnumKey(@"SYSTEM\CurrentControlSet\Enum\USB");
+            ScanEnumKey(@"SYSTEM\CurrentControlSet\Enum\HID");
+
+            _preExistingHidInstances = snapshot;
+
+            guardianCore?.EventLogger?.LogInfo(0, "Startup",
+                $"Pre-existing HID safe-list captured: {snapshot.Count} device instance(s)");
+            Debug.WriteLine($"[PreExistingHID] Snapshot complete — {snapshot.Count} trusted instance(s)");
+        }
+
         private void AutoWhitelistBuiltInDevices()
         {
             bool changed = false;
@@ -2054,7 +2169,7 @@ namespace USBGuardian
                                 // Check if it's considered built-in by the safety checker
                                 var tempFingerprint = new DeviceFingerprint { Vid = vid, Pid = pid, InstanceId = instanceId, Service = service };
                                 tempFingerprint.HardwareIds = deviceIdentifier.GetHardwareIds(vid, pid, instanceId);
-                                
+
                                 if (BuiltInDeviceSafetyChecker.IsDefinitelyBuiltIn(tempFingerprint))
                                 {
                                     bool alreadyPresent = whitelist.Any(w =>
@@ -2621,7 +2736,7 @@ namespace USBGuardian
 
                 // If device has any HID characteristics, capture the HID Report Descriptor hash
                 if ((fingerprint.DeviceClass != null && fingerprint.DeviceClass.Contains("HID")) ||
-                    fingerprint.Service == "mouhid" || 
+                    fingerprint.Service == "mouhid" ||
                     fingerprint.Service == "kbdhid" ||
                     fingerprint.Service == "hidusb")
                 {
@@ -3396,28 +3511,28 @@ namespace USBGuardian
                 return null;
             }
 
-             private string GetParentIdPrefix(string vid, string pid, string instanceId)
-             {
-                 if (string.IsNullOrEmpty(instanceId)) return null;
-                 try
-                 {
-                     string regPath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{vid}&PID_{pid}\{instanceId}";
-                     using (RegistryKey key = Registry.LocalMachine.OpenSubKey(regPath))
-                     {
-                         string parent = key?.GetValue("ParentIdPrefix")?.ToString();
-                         if (!string.IsNullOrEmpty(parent))
-                         {
-                             Debug.WriteLine($"ParentIdPrefix FOUND: {parent}");
-                             return parent;
-                         }
-                     }
-                 }
-                 catch (Exception ex)
-                 {
-                     Debug.WriteLine($"ParentIdPrefix error: {ex.Message}");
-                 }
-                 return null;
-             }
+            private string GetParentIdPrefix(string vid, string pid, string instanceId)
+            {
+                if (string.IsNullOrEmpty(instanceId)) return null;
+                try
+                {
+                    string regPath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{vid}&PID_{pid}\{instanceId}";
+                    using (RegistryKey key = Registry.LocalMachine.OpenSubKey(regPath))
+                    {
+                        string parent = key?.GetValue("ParentIdPrefix")?.ToString();
+                        if (!string.IsNullOrEmpty(parent))
+                        {
+                            Debug.WriteLine($"ParentIdPrefix FOUND: {parent}");
+                            return parent;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"ParentIdPrefix error: {ex.Message}");
+                }
+                return null;
+            }
 
             private string GetServiceName(string vid, string pid, string instanceId)
             {
@@ -3773,7 +3888,7 @@ namespace USBGuardian
         {
             if (other == null) return false;
 
-            int matchCount  = 0;
+            int matchCount = 0;
             int totalPossible = 0;
 
             // ── Hardware-anchored identifiers (highest trust) ─────────────────────────
