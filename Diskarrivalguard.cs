@@ -118,8 +118,6 @@ namespace USBGuardian
         [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
         private static extern int CM_Get_Device_IDW(uint dnDevInst, StringBuilder buffer, uint bufferLen, uint ulFlags);
 
-        private const uint CM_DISABLE_UI_NOT_OK = 0x00000001;
-
         // ── Constants ─────────────────────────────────────────────────────────[...]
 
         private const uint GENERIC_READ = 0x80000000;
