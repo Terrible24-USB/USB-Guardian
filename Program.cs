@@ -500,16 +500,32 @@ namespace USBGuardian
                 // Checks: VID+PID, SerialNumber, HardwareId (incl REV_), ContainerId,
                 //         CompatibleId, Service — ALL must match stored entry.
                 //
-                // MATCH   → mark pre-approved, skip CM_Disable_DevNode entirely.
-                //           Device loads silently with no freeze and no dialog.
-                // NO MATCH → fall through to freeze as normal (fail-closed).
+                // IMPORTANT: Early whitelist bypass applies ONLY to built-in (internal)
+                // devices identified by ACPI/INT/PNP/PCI hardware IDs.
+                // External USB devices (keyboards, mice, storage) ALWAYS go to dialog,
+                // even if their VID:PID matches a whitelist entry.
+                //
+                // MATCH (built-in)  → mark pre-approved, skip CM_Disable_DevNode entirely.
+                //                     Device loads silently with no freeze and no dialog.
+                // MATCH (external)  → fall through to freeze + dialog (user must approve).
+                // NO MATCH          → fall through to freeze as normal (fail-closed).
                 //
                 // Rubber Ducky: always fails — different serial + ContainerId + REV_.
-                // Legit keyboard/mouse: passes if previously whitelisted by user.
+                // Legit built-in keyboard/mouse: passes if previously whitelisted by user.
+
+                // NEW: Check if built-in BEFORE early whitelist to prevent external
+                // devices from bypassing the dialog via whitelist match.
+                bool isBuiltIn = IsBuiltInDevice(instanceId);
+
                 bool earlyAllowed = false;
                 try
                 {
-                    earlyAllowed = _earlyWhitelist?.IsEarlyWhitelisted(instanceId) ?? false;
+                    // Only early-whitelist BUILT-IN devices (ACPI/INT/PNP hardware IDs).
+                    // External USB devices always require explicit dialog approval.
+                    if (isBuiltIn)
+                    {
+                        earlyAllowed = _earlyWhitelist?.IsEarlyWhitelisted(instanceId) ?? false;
+                    }
                 }
                 catch (Exception ewEx)
                 {
@@ -522,8 +538,8 @@ namespace USBGuardian
                 {
                     _pnpEarlyApprovedInstances[instanceId] = true;
                     guardianCore?.EventLogger?.LogInfo(0, "PnpGuard",
-                        $"Early whitelist match — device allowed without freeze: {instanceId}");
-                    Debug.WriteLine($"[PnpGuard] Early approved (no freeze): {instanceId}");
+                        $"Early whitelist match (built-in) — device allowed without freeze: {instanceId}");
+                    Debug.WriteLine($"[PnpGuard] Early approved (built-in only): {instanceId}");
                     return;  // Device loads normally — CM_Disable_DevNode NOT called
                 }
                 // ── END EARLY WHITELIST CHECK ─────────────────────────────────────
@@ -560,6 +576,41 @@ namespace USBGuardian
             if (brace > 0) s = s.Substring(0, brace).TrimEnd('#').TrimEnd('\\');
             // Replace # with \
             return s.Replace('#', '\\').Trim('\\');
+        }
+
+        /// <summary>
+        /// Determines if a device is built-in (internal) vs external USB.
+        /// Built-in devices have ACPI/INT/PNP/PCI hardware IDs (non-USB internal components).
+        /// External USB devices have standard VID_/PID_ IDs.
+        /// Fails closed: returns false (external) on any error or missing data.
+        /// </summary>
+        private static bool IsBuiltInDevice(string instanceId)
+        {
+            try
+            {
+                string regPath = $@"SYSTEM\CurrentControlSet\Enum\{instanceId}";
+                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(regPath);
+                if (key == null) return false;
+
+                string[] hwIds = key.GetValue("HardwareID") as string[] ?? Array.Empty<string>();
+
+                // Built-in devices have ACPI/PCI/ROOT/BTHENUM prefixes in their hardware IDs.
+                // External USB devices use USB\VID_...\... style IDs and will not match.
+                // These prefixes align with BuiltInDeviceSafetyChecker.BuiltInHardwareIdPrefixes.
+                bool hasBuiltInMarker = hwIds.Any(h =>
+                    h.StartsWith("ACPI\\", StringComparison.OrdinalIgnoreCase) ||
+                    h.StartsWith("PCI\\", StringComparison.OrdinalIgnoreCase) ||
+                    h.StartsWith("ROOT\\", StringComparison.OrdinalIgnoreCase) ||
+                    h.StartsWith("BTHENUM\\", StringComparison.OrdinalIgnoreCase) ||
+                    h.StartsWith("HID\\VID_ACPI", StringComparison.OrdinalIgnoreCase));
+
+                return hasBuiltInMarker;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[IsBuiltInDevice] Error checking if built-in: {ex.Message}");
+                return false;  // Fail closed: treat unknown as external
+            }
         }
 
         private static string SafeGetString(ManagementObject obj, string propertyName)
