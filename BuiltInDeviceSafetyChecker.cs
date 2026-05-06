@@ -128,20 +128,6 @@ namespace USBGuardian
                 }
             }
 
-            // HID class (0x03) combined with known internal service
-            if (device.UsbDeviceClass == 0x03 || device.InterfaceClass == 0x03)
-            {
-                // HID devices could be internal keyboards/mice — flag as "might be"
-                if (!string.IsNullOrEmpty(device.Service) &&
-                    (device.Service.Equals("kbdhid", StringComparison.OrdinalIgnoreCase) ||
-                     device.Service.Equals("mouhid", StringComparison.OrdinalIgnoreCase) ||
-                     device.Service.Equals("hidusb", StringComparison.OrdinalIgnoreCase)))
-                {
-                    Debug.WriteLine($"[BuiltInCheck] Layer 1+HID match: service='{device.Service}'");
-                    return true;
-                }
-            }
-
             return false;
         }
 

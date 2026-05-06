@@ -30,7 +30,12 @@ namespace USBGuardian
             {
                 _blockingManager.BlockDevice(device, reason);
                 DisableInstanceConfigFlags(device);
-                DisableUsbStorService();
+
+                // Only kill the usbstor service globally on Critical threats.
+                // For lower-level threats, per-device ConfigFlags isolation is sufficient
+                // and avoids breaking the driver association (Code 28) for all storage devices.
+                if (level >= ThreatLevel.Critical)
+                    DisableUsbStorService();
 
                 _eventLogger.LogCritical(5, "ThreatIsolation", $"Threat isolation executed for {vidPid}: {reason}", vidPid);
                 _eventLogger.LogWindowsEvent(SecuritySeverity.Critical, "USB Guardian", $"Threat isolation executed for {vidPid}: {reason}");

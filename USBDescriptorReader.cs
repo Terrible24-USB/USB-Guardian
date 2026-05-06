@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -209,6 +209,7 @@ namespace USBGuardian
         private const uint IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION = 0x220410;
         private const uint IOCTL_USB_GET_NODE_CONNECTION_NAME = 0x220414;
         private const byte USB_BOS_DESCRIPTOR_TYPE = 0x0F;
+        private const uint IOCTL_HID_GET_REPORT_DESCRIPTOR = 0x000B01A3;
 
         // ===== Hub device interface GUID =====
         private static readonly Guid GUID_DEVINTERFACE_USB_HUB = new Guid("f18a0e88-c30c-11d0-8815-00a0c906bed8");
@@ -413,6 +414,36 @@ namespace USBGuardian
             uint DeviceInstanceIdSize,
             out uint RequiredSize);
 
+        [DllImport("hid.dll", SetLastError = true)]
+        private static extern bool HidD_GetPreparsedData(IntPtr HidDeviceObject, out IntPtr PreparsedData);
+
+        [DllImport("hid.dll", SetLastError = true)]
+        private static extern bool HidD_FreePreparsedData(IntPtr PreparsedData);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct HIDP_CAPS
+        {
+            public ushort Usage;
+            public ushort UsagePage;
+            public ushort InputReportByteLength;
+            public ushort OutputReportByteLength;
+            public ushort FeatureReportByteLength;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 17)]
+            public ushort[] Reserved;
+            public ushort NumberLinkCollectionNodes;
+            public ushort NumberInputButtonCaps;
+            public ushort NumberInputValueCaps;
+            public ushort NumberInputDataIndices;
+            public ushort NumberOutputButtonCaps;
+            public ushort NumberOutputValueCaps;
+            public ushort NumberOutputDataIndices;
+            public ushort NumberFeatureButtonCaps;
+            public ushort NumberFeatureValueCaps;
+            public ushort NumberFeatureDataIndices;
+        }
+
+        [DllImport("hid.dll", SetLastError = true)]
+        private static extern int HidP_GetCaps(IntPtr PreparsedData, out HIDP_CAPS Capabilities);
 
 
         // ===== Main method with diagnostic output =====
@@ -658,6 +689,172 @@ namespace USBGuardian
                 Debug.WriteLine($"[USBDescriptorReader] Exception: {ex.Message}");
                 return false;
             }
+        }
+
+        public static string CaptureHidReportDescriptorHash(string vid, string pid, string instanceId)
+        {
+            Debug.WriteLine($"[USBDescriptorReader] Attempting to capture HID Report Descriptor Hash for {vid}:{pid}");
+            
+            // Generate the target USB device ID string, e.g., "VID_XXXX&PID_XXXX"
+            string targetVidPid = $"VID_{vid}&PID_{pid}";
+            
+            Guid hidGuid = new Guid("4D1E55B2-F16F-11CF-88CB-001111000030");
+            IntPtr deviceInfo = SetupDiGetClassDevs(
+                ref hidGuid,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+
+            if (deviceInfo == IntPtr.Zero || deviceInfo == new IntPtr(-1))
+            {
+                return null;
+            }
+
+            try
+            {
+                SP_DEVICE_INTERFACE_DATA interfaceData = new SP_DEVICE_INTERFACE_DATA();
+                interfaceData.cbSize = Marshal.SizeOf(interfaceData);
+
+                // For composite HID devices, there could be multiple HID interfaces. We'll hash them all together.
+                List<byte[]> allDescriptors = new List<byte[]>();
+
+                int interfaceIndex = 0;
+                while (SetupDiEnumDeviceInterfaces(deviceInfo, IntPtr.Zero, ref hidGuid, interfaceIndex, ref interfaceData))
+                {
+                    interfaceIndex++;
+                    int requiredSize = 0;
+                    SetupDiGetDeviceInterfaceDetail(deviceInfo, ref interfaceData, IntPtr.Zero, 0, ref requiredSize, IntPtr.Zero);
+
+                    IntPtr detailBuffer = Marshal.AllocHGlobal(requiredSize);
+                    try
+                    {
+                        Marshal.WriteInt32(detailBuffer, IntPtr.Size == 8 ? 8 : 6);
+                        if (SetupDiGetDeviceInterfaceDetail(deviceInfo, ref interfaceData, detailBuffer, requiredSize, ref requiredSize, IntPtr.Zero))
+                        {
+                            IntPtr pDevicePath = IntPtr.Add(detailBuffer, 4);
+                            string devicePath = Marshal.PtrToStringAuto(pDevicePath);
+
+                            // Does this HID interface belong to our USB device?
+                            if (!string.IsNullOrEmpty(devicePath) && devicePath.IndexOf(targetVidPid, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                Debug.WriteLine($"[USBDescriptorReader] Found matching HID interface: {devicePath}");
+                                
+                                IntPtr hDevice = CreateFile(
+                                    devicePath,
+                                    0, // Query access is enough for HID
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    IntPtr.Zero,
+                                    OPEN_EXISTING,
+                                    0,
+                                    IntPtr.Zero);
+
+                                if (hDevice != IntPtr.Zero && hDevice != new IntPtr(-1))
+                                {
+                                    try
+                                    {
+                                        byte[] reportDescriptor = null;
+
+                                        // 1. Try IOCTL_HID_GET_REPORT_DESCRIPTOR
+                                        byte[] ioctlBuffer = new byte[8192]; // Large enough for most descriptors
+                                        GCHandle ioctlPin = GCHandle.Alloc(ioctlBuffer, GCHandleType.Pinned);
+                                        try
+                                        {
+                                            bool ioctlSuccess = DeviceIoControl(
+                                                hDevice,
+                                                IOCTL_HID_GET_REPORT_DESCRIPTOR,
+                                                IntPtr.Zero,
+                                                0,
+                                                ioctlPin.AddrOfPinnedObject(),
+                                                ioctlBuffer.Length,
+                                                out int bytesReturned,
+                                                IntPtr.Zero);
+
+                                            if (ioctlSuccess && bytesReturned > 0)
+                                            {
+                                                reportDescriptor = new byte[bytesReturned];
+                                                Array.Copy(ioctlBuffer, reportDescriptor, bytesReturned);
+                                                Debug.WriteLine($"[USBDescriptorReader] Captured {bytesReturned} bytes via IOCTL_HID_GET_REPORT_DESCRIPTOR.");
+                                            }
+                                        }
+                                        finally
+                                        {
+                                            ioctlPin.Free();
+                                        }
+
+                                        // 2. Fallback to HidD_GetPreparsedData
+                                        if (reportDescriptor == null)
+                                        {
+                                            if (HidD_GetPreparsedData(hDevice, out IntPtr preparsedData))
+                                            {
+                                                try
+                                                {
+                                                    // Unfortunately we don't know the exact length of preparsedData easily without parsing it.
+                                                    // But we can get caps.
+                                                    if (HidP_GetCaps(preparsedData, out HIDP_CAPS caps) == 0x110000 /* HIDP_STATUS_SUCCESS */)
+                                                    {
+                                                        // A heuristic: Read 512 bytes of preparsed data as a fallback hash source
+                                                        reportDescriptor = new byte[512];
+                                                        Marshal.Copy(preparsedData, reportDescriptor, 0, reportDescriptor.Length);
+                                                        Debug.WriteLine($"[USBDescriptorReader] Captured 512 bytes of PreparsedData as fallback.");
+                                                    }
+                                                }
+                                                finally
+                                                {
+                                                    HidD_FreePreparsedData(preparsedData);
+                                                }
+                                            }
+                                        }
+
+                                        if (reportDescriptor != null)
+                                        {
+                                            allDescriptors.Add(reportDescriptor);
+                                        }
+                                        else
+                                        {
+                                            Debug.WriteLine("[USBDescriptorReader] Failed to capture report descriptor or preparsed data.");
+                                        }
+                                    }
+                                    finally
+                                    {
+                                        CloseHandle(hDevice);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(detailBuffer);
+                    }
+                }
+
+                if (allDescriptors.Count > 0)
+                {
+                    using (SHA256 sha256 = SHA256.Create())
+                    {
+                        // Hash all gathered descriptors together
+                        int totalLen = allDescriptors.Sum(d => d.Length);
+                        byte[] combined = new byte[totalLen];
+                        int offset = 0;
+                        foreach (var desc in allDescriptors)
+                        {
+                            Buffer.BlockCopy(desc, 0, combined, offset, desc.Length);
+                            offset += desc.Length;
+                        }
+
+                        byte[] hash = sha256.ComputeHash(combined);
+                        string base64Hash = Convert.ToBase64String(hash).Substring(0, 32);
+                        Debug.WriteLine($"[USBDescriptorReader] Final HID Report Hash: {base64Hash}");
+                        return base64Hash;
+                    }
+                }
+            }
+            finally
+            {
+                SetupDiDestroyDeviceInfoList(deviceInfo);
+            }
+
+            return null;
         }
 
         // ===== Hub/port location with diagnostics =====

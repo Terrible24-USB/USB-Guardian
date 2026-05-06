@@ -358,7 +358,7 @@ namespace USBGuardian
                 // Use PowerShell to remove the drive letter assignment, which effectively dismounts
                 string letter = driveLetter.TrimEnd('\\', ':');
                 // Build the script and pass it via -EncodedCommand to avoid shell escaping issues
-                string script = $"$vol = Get-WmiObject -Class Win32_Volume -Filter \"DriveLetter='{letter}:'\"; if ($vol) {{ $vol.DriveLetter = $null; $vol.Put() | Out-Null }}";
+                string script = $"Get-Volume -DriveLetter '{letter}' -ErrorAction SilentlyContinue | Dismount-Volume -Confirm:$false";
                 string encodedCommand = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script));
 
                 var psi = new System.Diagnostics.ProcessStartInfo

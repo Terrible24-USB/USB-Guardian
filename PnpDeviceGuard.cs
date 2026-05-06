@@ -185,6 +185,7 @@ namespace USBGuardian
             IntPtr EventData,
             int EventDataSize)
         {
+            Debug.WriteLine($"[PnpDeviceGuard] OnPnpNotification Action={Action}");
             try
             {
                 if (Action == CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL)
@@ -194,7 +195,7 @@ namespace USBGuardian
                     // offset 20 (4 FilterType + 4 Reserved + 16 ClassGuid — on x64 the
                     // struct is naturally aligned so this is reliable).
                     string symLink = ReadSymbolicLink(EventData, EventDataSize);
-                    Debug.WriteLine($"[PnpDeviceGuard] Arrival: {symLink}");
+                    Debug.WriteLine($"[PnpDeviceGuard] Arrival detected: {symLink}");
                     DeviceArrived?.Invoke(symLink ?? string.Empty);
                 }
             }

@@ -1,4 +1,4 @@
-﻿using Microsoft.Win32;
+using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -122,6 +122,10 @@ namespace USBGuardian
         private readonly InputContainmentManager _inputContainment;
         private readonly ContainmentController _containmentController;
         private readonly PnpDeviceGuard _pnpGuard;
+        private EarlyWhitelistChecker _earlyWhitelist;
+        private DiskArrivalGuard _diskArrivalGuard;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool>
+            _pnpEarlyApprovedInstances = new(StringComparer.OrdinalIgnoreCase);
 
         public USBMessageWindow()
         {
@@ -162,7 +166,7 @@ namespace USBGuardian
                 new AllowedDevicesBackupManager(),
                 dryRun: unblockManager.DryRun);
 
-            _inputContainment = new InputContainmentManager(guardianCore.EventLogger);
+            _inputContainment = new InputContainmentManager(guardianCore.EventLogger, _uiContext);
             _containmentController = new ContainmentController(_inputContainment);
             Application.ApplicationExit += (_, _) => _inputContainment.Dispose();
 
@@ -170,6 +174,24 @@ namespace USBGuardian
             // Used to immediately freeze unknown devices via CM_Disable_DevNode.
             _pnpGuard = new PnpDeviceGuard();
             _pnpGuard.DeviceArrived += OnPnpDeviceArrived;
+            _earlyWhitelist = new EarlyWhitelistChecker(Application.StartupPath);
+
+            // DiskArrivalGuard: intercepts storage devices BEFORE partition table is read.
+            // Layer 2: exclusive disk handle blocks partmgr.sys → no volume = no drive letter.
+            // Layer 3: volume mount point deletion fallback if Layer 2 loses the race.
+            _diskArrivalGuard = new DiskArrivalGuard(guardianCore);
+            _diskArrivalGuard.SetWhitelistChecker(_earlyWhitelist);
+            try
+            {
+                _diskArrivalGuard.Register();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Startup] DiskArrivalGuard registration failed: {ex.Message}");
+                guardianCore?.EventLogger?.LogWarning(0, "DiskArrivalGuard",
+                    $"Disk arrival guard registration failed: {ex.Message}");
+            }
+            Application.ApplicationExit += (_, _) => _diskArrivalGuard.Dispose();
             try
             {
                 _pnpGuard.Register();
@@ -402,15 +424,113 @@ namespace USBGuardian
         {
             try
             {
-                // Derive the device instance ID from the symbolic link.
+                Debug.WriteLine($"[PnpGuard] Arrival: {symbolicLink}");
+                // ── LAYER A: block all deadly combos immediately ──────────────────
+                // Fires at ~T+10ms — before CM_Disable_DevNode completes and before
+                // the decision dialog opens (~T+500ms). Closes the ~13ms gap where a
+                // fast Ducky could slip WIN+R or similar through.
+                // Released automatically in Deactivate() after the dialog closes.
+                //
+                // IMPORTANT: PnpDeviceGuard fires for GUID_DEVINTERFACE_USB_DEVICE, so
+                // its symbolic link is always \\?\USB#VID_...#...#{A5DCBF10-...} regardless
+                // of whether the device is HID or storage. We cannot determine device type
+                // from the symlink text alone. Instead, we derive the instanceId first and
+                // do a fast registry Service-name read (~0.5ms) to check if it's HID. Only
+                // HID devices (kbdhid/mouhid/hidusb) can inject keystrokes; storage and hubs
+                // cannot. Activating the hook for non-HID devices would unnecessarily block
+                // the user's own keyboard during the storage authorization dialog.
+
+                // Derive the device instance ID first — we need it both for the HID check
+                // and for all subsequent operations.
                 // Symbolic link format: \\?\USB#VID_xxxx&PID_xxxx#instanceId#{guid}
                 // We need: USB\VID_xxxx&PID_xxxx\instanceId
                 string instanceId = SymbolicLinkToInstanceId(symbolicLink);
                 if (string.IsNullOrWhiteSpace(instanceId)) return;
 
-                // Only freeze HID-class or unknown devices — storage devices are
-                // handled by the existing EarlyBlockUsbInstanceKey path.
-                // We freeze everything here and let ProcessUsbDevice sort it out.
+                // Quick registry service read to decide whether to activate EarlyComboBlock.
+                // Fails silently — if we can't read the key, err on the side of activating
+                // the block (better to temporarily restrict combos than miss a Ducky).
+                bool activateComboBlock = true; // default: block (fail-closed for HID threat)
+                try
+                {
+                    // instanceId is already "USB\VID_xxxx&PID_xxxx\serial" (backslash-delimited).
+                    string regPath = $@"SYSTEM\CurrentControlSet\Enum\{instanceId}";
+                    using var regKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(regPath, writable: false);
+                    if (regKey != null)
+                    {
+                        string svc = regKey.GetValue("Service")?.ToString();
+                        // Only HID services can inject keystrokes. Storage/hub devices cannot.
+                        bool isHidService =
+                            string.Equals(svc, "kbdhid",   StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "mouhid",   StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "hidusb",   StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "kbdclass", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "mouclass", StringComparison.OrdinalIgnoreCase);
+                        bool isStorageOrHubService =
+                            string.Equals(svc, "usbstor", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "disk",    StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "USBHUB",  StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(svc, "USBHUB3", StringComparison.OrdinalIgnoreCase);
+
+                        if (isStorageOrHubService)
+                        {
+                            // Confirmed non-HID: do NOT activate combo block.
+                            activateComboBlock = false;
+                            Debug.WriteLine($"[PnpGuard] Non-HID device (svc={svc}) — EarlyComboBlock skipped: {instanceId}");
+                        }
+                        else if (!isHidService && svc != null)
+                        {
+                            // Unknown service — activate block as a precaution (fail-closed).
+                            Debug.WriteLine($"[PnpGuard] Unknown service '{svc}' — EarlyComboBlock activated as precaution: {instanceId}");
+                        }
+                    }
+                    // If key not found: registry not yet populated (device is still enumerating).
+                    // Activate block as a precaution.
+                }
+                catch (Exception regEx)
+                {
+                    Debug.WriteLine($"[PnpGuard] Service check failed ({regEx.Message}) — activating EarlyComboBlock as precaution");
+                }
+
+                if (activateComboBlock)
+                    _inputContainment.EarlyComboBlock();
+
+                // ── EARLY WHITELIST CHECK ─────────────────────────────────────────
+                // Registry-only reads (~0.5ms). No WMI, no IOCTL, no CM_* calls.
+                // Checks: VID+PID, SerialNumber, HardwareId (incl REV_), ContainerId,
+                //         CompatibleId, Service — ALL must match stored entry.
+                //
+                // MATCH   → mark pre-approved, skip CM_Disable_DevNode entirely.
+                //           Device loads silently with no freeze and no dialog.
+                // NO MATCH → fall through to freeze as normal (fail-closed).
+                //
+                // Rubber Ducky: always fails — different serial + ContainerId + REV_.
+                // Legit keyboard/mouse: passes if previously whitelisted by user.
+                bool earlyAllowed = false;
+                try
+                {
+                    earlyAllowed = _earlyWhitelist?.IsEarlyWhitelisted(instanceId) ?? false;
+                }
+                catch (Exception ewEx)
+                {
+                    // Any exception in the checker → fail closed, freeze the device.
+                    Debug.WriteLine($"[EarlyWhitelist] Checker threw: {ewEx.Message} — failing closed");
+                    earlyAllowed = false;
+                }
+
+                if (earlyAllowed)
+                {
+                    _pnpEarlyApprovedInstances[instanceId] = true;
+                    guardianCore?.EventLogger?.LogInfo(0, "PnpGuard",
+                        $"Early whitelist match — device allowed without freeze: {instanceId}");
+                    Debug.WriteLine($"[PnpGuard] Early approved (no freeze): {instanceId}");
+                    return;  // Device loads normally — CM_Disable_DevNode NOT called
+                }
+                // ── END EARLY WHITELIST CHECK ─────────────────────────────────────
+
+                // Default path: freeze everything. Let ProcessUsbDevice decide via
+                // full fingerprint + dialog. We freeze everything here and let
+                // ProcessUsbDevice sort it out.
                 bool frozen = PnpDeviceGuard.DisableDevNode(instanceId);
                 if (frozen)
                 {
@@ -520,13 +640,51 @@ namespace USBGuardian
                 if (pnpAlreadyFrozen)
                     LogDecisionPipeline("PNP_FROZEN", decisionKey, null, "Device was pre-frozen by PnP fast-path");
 
-                // EARLY BLOCK ─────────────────────────────────────────────────────────────
-                // Apply ConfigFlags disable bits on the USB instance key right now, before
-                // the slow fingerprint capture (WMI, SCSI IOCTL, USB hub IOCTLs) runs.
-                // This shrinks the window during which an unapproved drive is mounted from
-                // ~150–400 ms down to the few milliseconds it takes for a single registry
-                // read/write + cfgmgr32 rescan.  The block is reversed automatically if the
-                // full fingerprint later confirms the device is whitelisted.
+                // EARLY WHITELIST FAST-PATH ────────────────────────────────────────
+                // If OnPnpDeviceArrived matched this device against the early whitelist
+                // at T+10ms, skip the entire decision pipeline — device already loaded
+                // cleanly without ever being frozen. Just log history and return.
+                bool earlyApproved = !string.IsNullOrWhiteSpace(instanceId)
+                    && _pnpEarlyApprovedInstances.TryRemove(instanceId, out _);
+                if (earlyApproved)
+                {
+                    LogDecisionPipeline("EARLY_APPROVED", decisionKey, null,
+                        "Skipping pipeline — early whitelist match at T+10ms, device was never frozen");
+                    // Capture full fingerprint in background for history/display only
+                    _ = System.Threading.Tasks.Task.Run(() =>
+                    {
+                        try
+                        {
+                            DeviceFingerprint fp = deviceIdentifier.CaptureAllIdentifiers(
+                                devicePath, vid, pid, instanceId);
+                            historyManager.LogEvent(fp, DeviceEventType.Whitelisted,
+                                "Early whitelist — auto-approved at PnP arrival (T+10ms)");
+                        }
+                        catch { /* best-effort history only, never throw */ }
+                    });
+                    return;
+                }
+                // END EARLY WHITELIST FAST-PATH ───────────────────────────────────
+
+                // EARLY DUPLICATE GUARD ───────────────────────────────────────────────────
+                // If a decision is already pending for this exact device key (e.g. caused by
+                // a second WM_DEVICECHANGE fired by a cfgmgr32 rescan), bail out immediately
+                // before doing anything expensive. Use _decisionPromptLock — the same lock
+                // that TryBeginDecisionPrompt uses — so the read and the later authoritative
+                // Add in TryBeginDecisionPrompt are always serialised on the same object.
+                bool isDuplicate;
+                lock (_decisionPromptLock)
+                {
+                    isDuplicate = _pendingDecisionKeys.Contains(decisionKey);
+                }
+
+                if (isDuplicate)
+                {
+                    LogDecisionPipeline("PROMPT_SKIPPED_EARLY", decisionKey, null,
+                        "Duplicate insertion event for same device key — decision already in progress, skipping");
+                    return;
+                }
+
                 bool earlyBlockApplied = !string.IsNullOrWhiteSpace(instanceId)
                     && IsStorageServiceInstance(vid, pid, instanceId)
                     && EarlyBlockUsbInstanceKey(vid, pid, instanceId);
@@ -616,6 +774,14 @@ namespace USBGuardian
                     ShowBalloonTip(
                         "USB Device Allowed",
                         $"{currentDevice.Description ?? "Unknown Device"} has been allowed.");
+
+                    // Release EarlyComboBlock if OnPnpDeviceArrived activated it.
+                    // The containment scope (which normally calls Deactivate/EarlyComboUnblock)
+                    // is not entered on this early-return path, so we must release explicitly.
+                    _inputContainment.EarlyComboUnblock();
+
+                    // Release Layer 2 disk guard exclusive handle so it mounts immediately.
+                    _diskArrivalGuard?.ReleaseHeldHandleByInstanceId(instanceId);
                     return;
                 }
                 if (guardianCore.IsWhitelisted(currentDevice))
@@ -626,6 +792,12 @@ namespace USBGuardian
                     ShowBalloonTip(
                         "USB Device Allowed",
                         $"{currentDevice.Description ?? "Unknown Device"} has been allowed by security whitelist.");
+
+                    // Release EarlyComboBlock — containment scope not entered on this path.
+                    _inputContainment.EarlyComboUnblock();
+
+                    // Release Layer 2 disk guard exclusive handle.
+                    _diskArrivalGuard?.ReleaseHeldHandleByInstanceId(instanceId);
                     return;
                 }
 
@@ -689,11 +861,30 @@ namespace USBGuardian
                         RemoveTemporaryDecisionBlock(decisionKey);
                     }
 
+                    // Release Layer 2 disk guard exclusive handle before re-enumeration.
+                    _diskArrivalGuard?.ReleaseHeldHandleByInstanceId(instanceId);
+
                     if (userDecision == DeviceDecisionAction.AllowAndWhitelist)
                     {
                         whitelist.Add(currentDevice);
                         SaveWhitelist();
                         guardianCore.ApproveWhitelist(currentDevice);
+
+                        // Save to EarlyWhitelistChecker so next insertion takes the
+                        // fast path (no freeze, no dialog) at T+10ms.
+                        try
+                        {
+                            var earlyEntry = EarlyWhitelistChecker.BuildEntry(
+                                currentDevice,
+                                label: $"{currentDevice.Description ?? $"USB {vid}:{pid}"} (approved {DateTime.Now:yyyy-MM-dd})");
+                            _earlyWhitelist?.AddEntry(earlyEntry);
+                            Debug.WriteLine($"[EarlyWhitelist] Entry saved for future fast-path: {instanceId}");
+                        }
+                        catch (Exception ewEx)
+                        {
+                            // Non-fatal — device still allowed, just won't get fast-path next time
+                            Debug.WriteLine($"[EarlyWhitelist] Failed to save entry: {ewEx.Message}");
+                        }
                     }
 
                     LogDecisionPipeline("REENUM_STARTED", decisionKey, currentDevice,
@@ -712,8 +903,12 @@ namespace USBGuardian
                             ? "Recovery completed with replug required"
                             : "Recovery completed and device is ready");
 
-                    if (UsbStorageBlocker.IsUsbStorageDevice(currentDevice))
-                        guardianCore.TemporarilyEnableUsbStorage(currentDevice, 60);
+                    // NOTE: TemporarilyEnableUsbStorage is intentionally NOT called here.
+                    // RunAllowRecoveryWithRetry above already performs a full device
+                    // recovery (ConfigFlags cleared, WMI enable, cfgmgr32 re-enumeration).
+                    // Calling TemporarilyEnableUsbStorage again would:
+                    //   (a) log a second [PreBoot.TemporaryEnable] warning confusingly, and
+                    //   (b) trigger another cfgmgr32 rescan → another WM_DEVICECHANGE race.
 
                     // FIX: keystroke monitoring was never started for allowed HID devices,
                     // making Layer 3 RubberDucky detection completely inert.  Start it now
@@ -756,6 +951,11 @@ namespace USBGuardian
                 {
                     BlockDevice(currentDevice);
                 }
+
+                // NOW trigger rescan — after block is confirmed and dialog is closed.
+                // This drops the device node cleanly without interfering with the dialog flow.
+                TriggerRescanForBlock($"{vid}:{pid}");
+
                 historyManager.LogEvent(currentDevice, DeviceEventType.Blocked, $"User blocked device: {blockReason}");
             }
             catch (Exception ex)
@@ -969,9 +1169,11 @@ namespace USBGuardian
 
                 if (builtInResult == DialogResult.Yes)
                 {
-                    if (UsbStorageBlocker.IsUsbStorageDevice(device))
-                        guardianCore.TemporarilyEnableUsbStorage(device, 60);
-                    historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User allowed possible built-in device");
+                    whitelist.Add(device);
+                    SaveWhitelist();
+                    historyManager.LogEvent(device, DeviceEventType.Whitelisted, "User permanently allowed and whitelisted possible built-in device");
+
+                    RunAllowRecoveryWithRetry(device, waitTimeoutMs: 5000, maxAttempts: 5);
                 }
                 return;
             }
@@ -1487,8 +1689,12 @@ namespace USBGuardian
                         RegistryValueKind.DWord);
                 }
 
-                // Ask Windows to drop the now-disabled device node without waiting for a replug.
-                TriggerRescanForBlock($"{vid}:{pid}");
+                // NOTE: TriggerRescanForBlock intentionally NOT called here.
+                // Calling cfgmgr32 rescan at this point causes Windows to fire a second
+                // WM_DEVICECHANGE event which races with the decision dialog, causing
+                // TempDecisionUnblock to run while the dialog is still open → drive
+                // briefly re-mounts. ConfigFlags alone is sufficient to block access.
+                // The rescan is called later only after a Block decision is confirmed.
 
                 guardianCore?.EventLogger?.LogCritical(0, "EarlyBlock",
                     $"Early ConfigFlags block applied for unknown storage device " +
@@ -1497,7 +1703,7 @@ namespace USBGuardian
                     $"{vid}:{pid}");
 
                 Debug.WriteLine(
-                    $"[EarlyBlock] ConfigFlags + rescan applied for {vid}:{pid} at {DateTime.UtcNow:o}");
+                    $"[EarlyBlock] ConfigFlags applied for {vid}:{pid} at {DateTime.UtcNow:o}");
 
                 return true;
             }
@@ -1569,8 +1775,15 @@ namespace USBGuardian
             // 3. WMI Disable by exact device ID (most precise targeting)
             DisableStorageDeviceViaWmi(device, actions);
 
-            // 4. cfgmgr32 rescan — ask Windows to drop the device node now
-            TriggerRescanForBlock(vidPid);
+            // 4. cfgmgr32 rescan intentionally NOT called here.
+            // Calling TriggerRescanForBlock() causes Windows to fire a second
+            // WM_DEVICECHANGE event which spawns a second ProcessUsbDevice invocation.
+            // That second invocation races with the open decision dialog and unblocks
+            // the device before the user clicks — making the drive briefly accessible.
+            // ConfigFlags alone is sufficient: Windows applies the disable bits on the
+            // next natural enumeration. The rescan is only safe after block is confirmed
+            // and the dialog is closed (see TriggerRescanForBlock call in the Block path).
+            // See also: EarlyBlockUsbInstanceKey lines 1599–1604 (same reasoning).
 
             // Persist record so the caller can call UnblockDevice if the user allows the device
             string reason = temporaryForDecision
@@ -1761,46 +1974,63 @@ namespace USBGuardian
         {
             bool changed = false;
 
-            var builtInEntries = new[]
+            try
             {
-                new DeviceFingerprint
+                using var usbKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\USB");
+                if (usbKey != null)
                 {
-                    Vid = "BUILTIN",
-                    Pid = "KEYBOARD",
-                    Service = "kbdhid",
-                    Description = "Built-in Keyboard (auto-whitelisted)",
-                    DeviceClass = "HIDClass"
-                },
-                new DeviceFingerprint
-                {
-                    Vid = "BUILTIN",
-                    Pid = "MOUSE",
-                    Service = "mouhid",
-                    Description = "Built-in Mouse/Trackpad (auto-whitelisted)",
-                    DeviceClass = "HIDClass"
-                },
-                new DeviceFingerprint
-                {
-                    Vid = "ACPI",
-                    Pid = "BUTTON",
-                    Service = "acpibtn",
-                    Description = "ACPI Button Device (auto-whitelisted)",
-                    DeviceClass = "System"
-                },
-            };
+                    foreach (string vidPidFolder in usbKey.GetSubKeyNames())
+                    {
+                        var match = System.Text.RegularExpressions.Regex.Match(vidPidFolder, @"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                        if (!match.Success) continue;
 
-            foreach (var entry in builtInEntries)
-            {
-                bool alreadyPresent = whitelist.Any(w =>
-                    string.Equals(w.Vid, entry.Vid, StringComparison.OrdinalIgnoreCase) &&
-                    string.Equals(w.Pid, entry.Pid, StringComparison.OrdinalIgnoreCase));
+                        string vid = match.Groups[1].Value;
+                        string pid = match.Groups[2].Value;
 
-                if (!alreadyPresent)
-                {
-                    whitelist.Add(entry);
-                    Debug.WriteLine($"Auto-whitelisted built-in device: {entry.Description}");
-                    changed = true;
+                        using var vidPidKey = usbKey.OpenSubKey(vidPidFolder);
+                        if (vidPidKey == null) continue;
+
+                        foreach (string instanceId in vidPidKey.GetSubKeyNames())
+                        {
+                            using var instanceKey = vidPidKey.OpenSubKey(instanceId);
+                            if (instanceKey == null) continue;
+
+                            string service = instanceKey.GetValue("Service")?.ToString();
+                            if (string.Equals(service, "kbdhid", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(service, "mouhid", StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(service, "hidusb", StringComparison.OrdinalIgnoreCase))
+                            {
+                                // Check if it's considered built-in by the safety checker
+                                var tempFingerprint = new DeviceFingerprint { Vid = vid, Pid = pid, InstanceId = instanceId, Service = service };
+                                tempFingerprint.HardwareIds = deviceIdentifier.GetHardwareIds(vid, pid, instanceId);
+                                
+                                if (BuiltInDeviceSafetyChecker.IsDefinitelyBuiltIn(tempFingerprint))
+                                {
+                                    bool alreadyPresent = whitelist.Any(w =>
+                                        string.Equals(w.Vid, vid, StringComparison.OrdinalIgnoreCase) &&
+                                        string.Equals(w.Pid, pid, StringComparison.OrdinalIgnoreCase) &&
+                                        string.Equals(w.InstanceId, instanceId, StringComparison.OrdinalIgnoreCase));
+
+                                    if (!alreadyPresent)
+                                    {
+                                        DeviceFingerprint fp = deviceIdentifier.CaptureAllIdentifiers(null, vid, pid, instanceId);
+                                        if (!string.IsNullOrEmpty(fp.Description))
+                                            fp.Description += " (auto-whitelisted built-in)";
+                                        else
+                                            fp.Description = "Built-in Device (auto-whitelisted)";
+                                        whitelist.Add(fp);
+                                        Debug.WriteLine($"Auto-whitelisted built-in device: {vid}:{pid} ({service})");
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error during auto-whitelist: {ex.Message}");
             }
 
             if (changed)
@@ -2241,7 +2471,7 @@ namespace USBGuardian
                 fingerprint.ContainerId = GetContainerId(vid, pid, instanceId);
 
                 // Get ParentIdPrefix
-                fingerprint.ParentIdPrefix = GetParentIdPrefix(vid, pid);
+                fingerprint.ParentIdPrefix = GetParentIdPrefix(vid, pid, instanceId);
 
                 // Get service and hardware IDs
                 fingerprint.Service = GetServiceName(vid, pid, instanceId);
@@ -2306,6 +2536,7 @@ namespace USBGuardian
                 // Derive interface numbers from USB descriptor (more accurate than device path)
                 if (fingerprint.AllInterfaces != null && fingerprint.AllInterfaces.Count > 0)
                 {
+                    fingerprint.InterfaceCount = fingerprint.AllInterfaces.Count;
                     var nums = fingerprint.AllInterfaces
                         .Select(i => i.InterfaceNumber.ToString())
                         .Distinct()
@@ -2335,6 +2566,15 @@ namespace USBGuardian
                         fingerprint.InterfaceSubClass,
                         fingerprint.InterfaceProtocol);
                     fingerprint.DeviceTypes = singleType;
+                }
+
+                // If device has any HID characteristics, capture the HID Report Descriptor hash
+                if ((fingerprint.DeviceClass != null && fingerprint.DeviceClass.Contains("HID")) ||
+                    fingerprint.Service == "mouhid" || 
+                    fingerprint.Service == "kbdhid" ||
+                    fingerprint.Service == "hidusb")
+                {
+                    fingerprint.HidReportDescriptorHash = USBDescriptorReader.CaptureHidReportDescriptorHash(vid, pid, instanceId);
                 }
 
                 Debug.WriteLine($"Device Types: {fingerprint.DeviceTypes ?? "Unknown"}");
@@ -2396,6 +2636,7 @@ namespace USBGuardian
                             fingerprint.DriverKeyName = key.GetValue("Driver")?.ToString();
                             fingerprint.LocationInfo = key.GetValue("LocationInformation")?.ToString();
                             fingerprint.Enumerator = key.GetValue("EnumeratorName")?.ToString();
+                            fingerprint.ParentIdPrefix = key.GetValue("ParentIdPrefix")?.ToString();
 
                             object addrObj = key.GetValue("Address");
                             if (addrObj != null)
@@ -2548,8 +2789,7 @@ namespace USBGuardian
             {
                 try
                 {
-                    Console.Clear();
-
+                    // No Console.Clear() since this is a WinForms app
                     Console.ForegroundColor = ConsoleColor.Cyan;
                     Console.WriteLine("╔════════════════════════════════════════════════════════════════════════════╗");
                     Console.WriteLine("║                    USB DEVICE IDENTIFIERS REPORT                          ║");
@@ -3105,47 +3345,28 @@ namespace USBGuardian
                 return null;
             }
 
-            private string GetParentIdPrefix(string vid, string pid)
-            {
-                try
-                {
-                    string basePath = @"SYSTEM\CurrentControlSet\Enum\USB";
-                    string vidPid = $"VID_{vid}&PID_{pid}";
-
-                    using (RegistryKey usbRoot = Registry.LocalMachine.OpenSubKey(basePath))
-                    {
-                        foreach (string deviceKey in usbRoot.GetSubKeyNames())
-                        {
-                            if (!deviceKey.StartsWith(vidPid, StringComparison.OrdinalIgnoreCase))
-                                continue;
-
-                            Debug.WriteLine($"Found matching device key: {deviceKey}");
-                            using (RegistryKey vidPidKey = usbRoot.OpenSubKey(deviceKey))
-                            {
-                                foreach (string instance in vidPidKey.GetSubKeyNames())
-                                {
-                                    Debug.WriteLine($"Checking instance: {instance}");
-                                    using (RegistryKey instanceKey = vidPidKey.OpenSubKey(instance))
-                                    {
-                                        string parent = instanceKey?.GetValue("ParentIdPrefix")?.ToString();
-                                        if (!string.IsNullOrEmpty(parent))
-                                        {
-                                            Debug.WriteLine($"ParentIdPrefix FOUND: {parent}");
-                                            return parent;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"ParentIdPrefix error: {ex.Message}");
-                }
-                Debug.WriteLine("ParentIdPrefix NOT FOUND for this device.");
-                return null;
-            }
+             private string GetParentIdPrefix(string vid, string pid, string instanceId)
+             {
+                 if (string.IsNullOrEmpty(instanceId)) return null;
+                 try
+                 {
+                     string regPath = $@"SYSTEM\CurrentControlSet\Enum\USB\VID_{vid}&PID_{pid}\{instanceId}";
+                     using (RegistryKey key = Registry.LocalMachine.OpenSubKey(regPath))
+                     {
+                         string parent = key?.GetValue("ParentIdPrefix")?.ToString();
+                         if (!string.IsNullOrEmpty(parent))
+                         {
+                             Debug.WriteLine($"ParentIdPrefix FOUND: {parent}");
+                             return parent;
+                         }
+                     }
+                 }
+                 catch (Exception ex)
+                 {
+                     Debug.WriteLine($"ParentIdPrefix error: {ex.Message}");
+                 }
+                 return null;
+             }
 
             private string GetServiceName(string vid, string pid, string instanceId)
             {
@@ -3162,7 +3383,7 @@ namespace USBGuardian
                 return null;
             }
 
-            private List<string> GetHardwareIds(string vid, string pid, string instanceId)
+            public List<string> GetHardwareIds(string vid, string pid, string instanceId)
             {
                 var ids = new List<string>();
                 try
@@ -3361,6 +3582,7 @@ namespace USBGuardian
         public string InterfaceDescriptorHash { get; set; }
         public string EndpointDescriptorHash { get; set; }
         public string DescriptorHash { get; set; }
+        public string HidReportDescriptorHash { get; set; }
 
         // Interface descriptor fields (first interface, or most representative)
         public byte InterfaceClass { get; set; }
@@ -3484,6 +3706,8 @@ namespace USBGuardian
                 components.Add($"NUMCFG:{NumConfigurations}");
             if (MaxPacketSize0 > 0)
                 components.Add($"MPS:{MaxPacketSize0}");
+            if (!string.IsNullOrEmpty(HidReportDescriptorHash))
+                components.Add($"HIDHASH:{HidReportDescriptorHash}");
 
             string combined = string.Join("||", components);
 
@@ -3498,20 +3722,47 @@ namespace USBGuardian
         {
             if (other == null) return false;
 
-            int matchCount = 0;
+            int matchCount  = 0;
             int totalPossible = 0;
+
+            // ── Hardware-anchored identifiers (highest trust) ─────────────────────────
+            // These are hard or impossible to spoof simultaneously:
+            //   SerialNumber  — reported by firmware; Ducky uses a different serial.
+            //   ContainerId   — Windows-assigned GUID tied to the specific port+device combo.
+            //   DescriptorHash — SHA-256 of all USB descriptors; changes if firmware differs.
+
+            bool hardwareAnchorMatch = false;
 
             if (!string.IsNullOrEmpty(this.SerialNumber) && !string.IsNullOrEmpty(other.SerialNumber))
             {
                 totalPossible++;
-                if (this.SerialNumber == other.SerialNumber) matchCount++;
+                bool m = this.SerialNumber == other.SerialNumber;
+                if (m) { matchCount++; hardwareAnchorMatch = true; }
             }
 
             if (!string.IsNullOrEmpty(this.ContainerId) && !string.IsNullOrEmpty(other.ContainerId))
             {
                 totalPossible++;
-                if (this.ContainerId == other.ContainerId) matchCount++;
+                bool m = this.ContainerId == other.ContainerId;
+                if (m) { matchCount++; hardwareAnchorMatch = true; }
             }
+
+            if (!string.IsNullOrEmpty(this.DescriptorHash) && !string.IsNullOrEmpty(other.DescriptorHash))
+            {
+                totalPossible++;
+                bool m = this.DescriptorHash == other.DescriptorHash;
+                if (m) { matchCount++; hardwareAnchorMatch = true; }
+            }
+
+            if (!string.IsNullOrEmpty(this.HidReportDescriptorHash) && !string.IsNullOrEmpty(other.HidReportDescriptorHash))
+            {
+                totalPossible++;
+                bool m = this.HidReportDescriptorHash == other.HidReportDescriptorHash;
+                if (m) { matchCount++; hardwareAnchorMatch = true; }
+            }
+
+            // ── Supplementary identifiers (medium trust) ──────────────────────────────
+            // These are useful corroboration but individually cloneable.
 
             if (!string.IsNullOrEmpty(this.ParentIdPrefix) && !string.IsNullOrEmpty(other.ParentIdPrefix))
             {
@@ -3537,21 +3788,25 @@ namespace USBGuardian
                 if (this.HardwareIds.Intersect(other.HardwareIds).Any()) matchCount++;
             }
 
-            if (this.EnumerationTimeMs > 0 && other.EnumerationTimeMs > 0)
-            {
-                totalPossible++;
-                long diff = Math.Abs(this.EnumerationTimeMs - other.EnumerationTimeMs);
-                if (diff < 200) matchCount++;
-            }
+            // NOTE: EnumerationTimeMs is intentionally excluded — it is a timing metric
+            // that varies per USB port, system load, and boot. Including it as a match
+            // dimension inflates totalPossible and causes false mismatches on replug.
 
-            // Compare descriptor hash if both exist
-            if (!string.IsNullOrEmpty(this.DescriptorHash) && !string.IsNullOrEmpty(other.DescriptorHash))
-            {
-                totalPossible++;
-                if (this.DescriptorHash == other.DescriptorHash) matchCount++;
-            }
+            // ── Match criteria ────────────────────────────────────────────────────────
+            // To be considered the same device, ALL scored identifiers must agree AND
+            // one of the following trust bars must be satisfied:
+            //
+            //   (a) At least one hardware-anchored identifier matched  (strongest — anti-spoof)
+            //   (b) At least 2 identifiers are in agreement            (moderate — depth-of-match)
+            //
+            // A single supplementary field matching alone is insufficient. For example, a
+            // Rubber Ducky that clones VID:PID and has the same HardwareIds list would only
+            // satisfy (b) if HardwareIds is the only identifier scored — it won't pass.
 
-            return totalPossible >= 2 && matchCount >= 2;
+            if (totalPossible < 1 || matchCount != totalPossible)
+                return false;
+
+            return hardwareAnchorMatch || totalPossible >= 2;
         }
     }
 }
