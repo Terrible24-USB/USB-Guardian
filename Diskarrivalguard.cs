@@ -9,7 +9,7 @@ using Microsoft.Win32;
 
 namespace USBGuardian
 {
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════[...]
     //  DiskArrivalGuard
     //
     //  THE PROBLEM IT SOLVES:
@@ -17,7 +17,7 @@ namespace USBGuardian
     //  has already mounted the volume and Explorer shows the drive letter.
     //  This is a 1-second window where malicious storage is accessible.
     //
-    //  THE APPROACH — THREE LAYERS, PURE USER-MODE:
+    //  THE APPROACH — TWO LAYERS, PURE USER-MODE:
     //
     //  LAYER 2 — GUID_DEVINTERFACE_DISK (fires before partition table is read):
     //    Windows stack order:
@@ -34,7 +34,7 @@ namespace USBGuardian
     //    No partition table read = no volmgr volume = no drive letter. Ever.
     //
     //    If whitelisted → CloseHandle() → partmgr retries → mounts normally.
-    //    If not whitelisted → hold handle + eject → device gone.
+    //    If not whitelisted → hold handle + PnP freeze keeps it frozen → device gone.
     //
     //    Thread priority: TIME_CRITICAL — we MUST beat partmgr's worker thread.
     //
@@ -48,13 +48,13 @@ namespace USBGuardian
     //    All operations fail-closed: any exception → device stays blocked.
     //    Whitelisted devices: handle released within ~100ms → mounts normally.
     //    No registry writes in the hot path.
-    //    Does NOT touch CM_Disable_DevNode (that's PnpDeviceGuard's job).
+    //    PnpDeviceGuard handles CM_Disable_DevNode (this layer only does exclusive lock).
     //
     //  INTEGRATION:
     //    Instantiate in USBMessageWindow constructor.
     //    Call SetWhitelistChecker() to wire in EarlyWhitelistChecker.
     //    DiskArrivalGuard runs completely independently on its own threads.
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════[...]
 
     internal sealed class DiskArrivalGuard : IDisposable
     {
@@ -118,12 +118,9 @@ namespace USBGuardian
         [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
         private static extern int CM_Get_Device_IDW(uint dnDevInst, StringBuilder buffer, uint bufferLen, uint ulFlags);
 
-        [DllImport("cfgmgr32.dll")]
-        private static extern int CM_Disable_DevNode(uint dnDevInst, uint ulFlags);
-
         private const uint CM_DISABLE_UI_NOT_OK = 0x00000001;
 
-        // ── Constants ────────────────────────────────────────────────────────────
+        // ── Constants ─────────────────────────────────────────────────────────[...]
 
         private const uint GENERIC_READ = 0x80000000;
         private const uint GENERIC_WRITE = 0x40000000;
@@ -185,7 +182,7 @@ namespace USBGuardian
             public string SymbolicLink;   // variable length — read via Marshal
         }
 
-        // ── State ────────────────────────────────────────────────────────────────
+        // ── State ─────────────────────────────────────────────────────────[...]
 
         private IntPtr _diskNotifyHandle = IntPtr.Zero;
         private IntPtr _volumeNotifyHandle = IntPtr.Zero;
@@ -218,7 +215,7 @@ namespace USBGuardian
         // 0 = live, 1 = disposed (set atomically via Interlocked)
         private int _disposed;
 
-        // ── Constructor ──────────────────────────────────────────────────────────
+        // ── Constructor ───────────────────────────────────────────────────────[...]
 
         public DiskArrivalGuard(UsbGuardianCore core)
         {
@@ -230,7 +227,7 @@ namespace USBGuardian
             _whitelist = checker;
         }
 
-        // ── Registration ─────────────────────────────────────────────────────────
+        // ── Registration ────────────────────────────────────────────────────────[...]
 
         public void Register()
         {
@@ -344,23 +341,16 @@ namespace USBGuardian
                     return;
                 }
 
-                // ── INSTANT KILL (Double-Lock) ────────────────────────────────────
-                // We kill BOTH the storage child and the USB parent controller.
-                // This is the "Nuke" option to ensure zero-time containment.
-                Debug.WriteLine($"[DiskArrivalGuard] NOT whitelisted — killing device node and parent instantly");
-                _core?.EventLogger?.LogWarning(0, "DiskArrivalGuard",
-                    $"Blocked unwhitelisted USB disk: {symLink}");
-                
-                // Kill parent first (strongest)
-                if (!string.IsNullOrEmpty(effectiveId) && effectiveId.StartsWith("USB\\"))
-                    DisableDeviceNode(effectiveId);
-                
-                // Kill child as well (fastest)
-                DisableDeviceNode(instanceId);
+                // ── EXCLUSIVE LOCK ONLY (Layer 2: Block partmgr.sys) ──────────────
+                // DO NOT call CM_Disable_DevNode here! PnpDeviceGuard already did that
+                // at T+10ms. We only need to hold the exclusive file handle to prevent
+                // partmgr.sys from reading the partition table.
+                // 
+                // If whitelisted → release handle → partmgr retries → volume mounts cleanly
+                // If blocked → hold handle → device stays frozen by PnP → never mounts
 
-                // ── SECONDARY LOCK (Exclusive Open) ───────────────────────────────
-                // Even if the kill command is slightly delayed, we try to grab the 
-                // handle to block partmgr.sys as a fail-safe.
+                Debug.WriteLine($"[DiskArrivalGuard] NOT whitelisted — attempting exclusive disk lock");
+                
                 IntPtr hDisk = CreateFileW(
                     symLink,
                     GENERIC_READ | GENERIC_WRITE,
@@ -372,13 +362,16 @@ namespace USBGuardian
 
                 if (hDisk != INVALID_HANDLE)
                 {
-                    Debug.WriteLine($"[DiskArrivalGuard] Exclusive handle acquired — double locked");
+                    Debug.WriteLine($"[DiskArrivalGuard] Exclusive handle acquired — disk locked");
                     _diskPaths[symLink] = symLink;
                     _heldHandles[symLink] = hDisk;
                     if (!string.IsNullOrWhiteSpace(instanceId))
                         _instanceToSymLink[instanceId] = symLink;
 
-                    // Poll until user decision
+                    _core?.EventLogger?.LogWarning(0, "DiskArrivalGuard",
+                        $"Acquired exclusive lock on USB disk: {symLink}");
+
+                    // Poll until user decision (will be released by ReleaseHeldHandleByInstanceId)
                     for (int i = 0; i < 300 && _disposed == 0; i++)
                     {
                         if (_releasedByDecision.ContainsKey(symLink)) break;
@@ -391,26 +384,17 @@ namespace USBGuardian
                     if (!string.IsNullOrWhiteSpace(instanceId))
                         _instanceToSymLink.TryRemove(instanceId, out _);
                     CloseHandle(hDisk);
+
+                    Debug.WriteLine($"[DiskArrivalGuard] Exclusive handle released for: {symLink}");
                 }
                 else
                 {
-                    Debug.WriteLine($"[DiskArrivalGuard] Primary kill sent, secondary lock skipped (race lost or already gone)");
+                    Debug.WriteLine($"[DiskArrivalGuard] Could not acquire exclusive lock (device may already be gone or race condition)");
                 }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"[DiskArrivalGuard] HandleDiskArrival exception: {ex.Message}");
-            }
-        }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[DiskArrivalGuard] HandleDiskArrival exception: {ex.Message}");
-                if (_heldHandles.TryRemove(symLink, out IntPtr h) && h != INVALID_HANDLE)
-                    CloseHandle(h);
-                _diskPaths.TryRemove(symLink, out _);
-                if (!string.IsNullOrWhiteSpace(instanceId))
-                    _instanceToSymLink.TryRemove(instanceId, out _);
             }
         }
 
@@ -585,7 +569,7 @@ namespace USBGuardian
             }
         }
 
-        // ── Helpers ──────────────────────────────────────────────────────────────
+        // ── Helpers ─────────────────────────────────────────────────────────[...]
 
         private static string ResolvePhysicalDrivePath(string symLink)
         {
@@ -628,74 +612,34 @@ namespace USBGuardian
         }
 
         /// <summary>
-        /// Reads the parent USB instanceId from the USBSTOR registry key's ParentIdPrefix.
+        /// Resolves the USB parent instance ID via cfgmgr32 (fast, without registry scan).
         /// </summary>
-        private static string ResolveUsbParentInstanceId(string usbstorInstanceId)
+        private string GetUsbParentInstanceId(string instanceId)
         {
-            if (string.IsNullOrWhiteSpace(usbstorInstanceId)) return string.Empty;
             try
             {
-                string regPath = $@"SYSTEM\CurrentControlSet\Enum\{usbstorInstanceId}";
-                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(regPath, writable: false);
-                if (key == null) return string.Empty;
+                if (CM_Locate_DevNodeW(out uint devInst, instanceId, 0) != CR_SUCCESS)
+                    return null;
 
-                string parentIdPrefix = key.GetValue("ParentIdPrefix")?.ToString();
-                if (string.IsNullOrWhiteSpace(parentIdPrefix)) return string.Empty;
+                if (CM_Get_Parent(out uint parentInst, devInst, 0) != CR_SUCCESS)
+                    return null;
 
-                // ParentIdPrefix is like "6&393d258a&0", we need to find the USB device with this prefix.
-                // However, the ParentIdPrefix maps to the child's *parent's* instance serial number.
-                // It's not a direct lookup unless we scan Enum\USB. But typically the USBSTOR instanceId
-                // string itself can be parsed or we can just use the ParentIdPrefix if ProcessUsbDevice
-                // will match on it.
-                // Let's check how the caller uses it. ProcessUsbDevice instanceId is `USB\VID_xxxx&PID_xxxx\serial`.
-                // Actually, the parent of a USBSTOR device is the USB composite device.
-                // For simplicity, we can do a registry search or if we can extract it:
-                // Is it easier to look up HKLM\SYSTEM\CurrentControlSet\Enum\USB and match?
-                // Actually, Windows stores the parent in `Device Parameters\SymbolicName` or we can find it via SetupAPI, 
-                // but for pure registry without SetupAPI:
-                // In `HKLM\SYSTEM\CurrentControlSet\Enum\{usbstorInstanceId}`, we have `ParentIdPrefix`.
-                // If we don't know the parent's VID/PID, we can't easily construct `USB\VID_xxxx&PID_xxxx\serial`.
-                // BUT wait, in EarlyWhitelistChecker we parse instanceId.
-                // Let's implement a quick registry search to find the USB instance with this ParentIdPrefix.
-                
-                using var usbKey = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\USB", writable: false);
-                if (usbKey == null) return string.Empty;
-
-                foreach (string vidPid in usbKey.GetSubKeyNames())
+                StringBuilder sb = new StringBuilder(200);
+                if (CM_Get_Device_IDW(parentInst, sb, (uint)sb.Capacity, 0) == CR_SUCCESS)
                 {
-                    using var vidPidKey = usbKey.OpenSubKey(vidPid, writable: false);
-                    if (vidPidKey == null) continue;
-
-                    foreach (string serial in vidPidKey.GetSubKeyNames())
+                    string parentId = sb.ToString();
+                    if (parentId.StartsWith("USB\\", StringComparison.OrdinalIgnoreCase))
                     {
-                        // Check if this serial matches the ParentIdPrefix? 
-                        // Wait, if it's the parent, its instance ID *is* the parent.
-                        // We can look at ParentIdPrefix. No, the parent's generated instance string contains the ParentIdPrefix?
-                        // Or we can just look at `HKLM\SYSTEM\CurrentControlSet\Enum\USBSTOR\{usbstorInstanceId}`'s `ContainerID`.
-                        // Then find the `USB\...` device with the SAME `ContainerID`.
-                        
-                        using var serialKey = vidPidKey.OpenSubKey(serial, writable: false);
-                        if (serialKey != null)
-                        {
-                            // A simple hack without scanning: we can just check if ProcessUsbDevice 
-                            // uses the exact USB instanceId. Let's use ContainerID to match if possible.
-                            // But scanning all USB devices takes <1ms anyway.
-                            string containerId1 = key.GetValue("ContainerID")?.ToString();
-                            string containerId2 = serialKey.GetValue("ContainerID")?.ToString();
-
-                            if (!string.IsNullOrEmpty(containerId1) && containerId1.Equals(containerId2, StringComparison.OrdinalIgnoreCase))
-                            {
-                                return $@"USB\{vidPid}\{serial}";
-                            }
-                        }
+                        Debug.WriteLine($"[DiskArrivalGuard] Resolved parent USB ID: {parentId}");
+                        return parentId;
                     }
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[DiskArrivalGuard] ResolveUsbParentInstanceId error: {ex.Message}");
+                Debug.WriteLine($"[DiskArrivalGuard] GetUsbParentInstanceId error: {ex.Message}");
             }
-            return string.Empty;
+            return null;
         }
 
         private static void EjectDisk(IntPtr hDisk)
@@ -712,7 +656,7 @@ namespace USBGuardian
             }
         }
 
-        // ── Dispose ──────────────────────────────────────────────────────────────
+        // ── Dispose ─────────────────────────────────────────────────────────[...]
 
         /// <summary>
         /// Called by ProcessUsbDevice's Allow path to release the exclusive handle
@@ -760,52 +704,6 @@ namespace USBGuardian
                 // or it already released (whitelisted path). Safe no-op.
                 Debug.WriteLine($"[DiskArrivalGuard] ReleaseHeldHandleByInstanceId: no handle held for {instanceId} (already released or Layer 2 skipped)");
             }
-        }
-
-        private void DisableDeviceNode(string instanceId)
-        {
-            try
-            {
-                if (CM_Locate_DevNodeW(out uint devInst, instanceId, 0) == CR_SUCCESS)
-                {
-                    int cr = CM_Disable_DevNode(devInst, CM_DISABLE_UI_NOT_OK);
-                    Debug.WriteLine(cr == CR_SUCCESS
-                        ? $"[DiskArrivalGuard] CM_Disable_DevNode succeeded for {instanceId}"
-                        : $"[DiskArrivalGuard] CM_Disable_DevNode failed CR=0x{cr:X}");
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[DiskArrivalGuard] DisableDeviceNode error: {ex.Message}");
-            }
-        }
-
-        private string GetUsbParentInstanceId(string instanceId)
-        {
-            try
-            {
-                if (CM_Locate_DevNodeW(out uint devInst, instanceId, 0) != CR_SUCCESS)
-                    return null;
-
-                if (CM_Get_Parent(out uint parentInst, devInst, 0) != CR_SUCCESS)
-                    return null;
-
-                StringBuilder sb = new StringBuilder(200);
-                if (CM_Get_Device_IDW(parentInst, sb, (uint)sb.Capacity, 0) == CR_SUCCESS)
-                {
-                    string parentId = sb.ToString();
-                    if (parentId.StartsWith("USB\\", StringComparison.OrdinalIgnoreCase))
-                    {
-                        Debug.WriteLine($"[DiskArrivalGuard] Resolved parent USB ID: {parentId}");
-                        return parentId;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"[DiskArrivalGuard] GetUsbParentInstanceId error: {ex.Message}");
-            }
-            return null;
         }
 
         public void Dispose()
