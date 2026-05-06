@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -43,6 +43,7 @@ namespace USBGuardian
         };
 
         // ── VK codes ────────────────────────────────────────────────────────────────
+// ── VK codes ────────────────────────────────────────────────────────────────
         private const int VK_LWIN = 0x5B;
         private const int VK_RWIN = 0x5C;
         private const int VK_APPS = 0x5D; // context menu key
@@ -64,6 +65,13 @@ namespace USBGuardian
         private const int WM_SYSKEYDOWN = 0x0104;
         private const int LLKHF_ALTDOWN = 0x20;
 
+        // ── WM_MOUSE messages that arrive via WH_MOUSE_LL ────────────────────────────
+        private const int WM_MOUSEMOVE   = 0x0200;
+        private const int WM_LBUTTONDOWN = 0x0201;
+        private const int WM_RBUTTONDOWN = 0x0204;
+        private const int WM_MBUTTONDOWN = 0x0207;
+        private const int WM_MOUSEWHEEL  = 0x020A;
+
         private readonly SecurityEventLogger _logger;
         private readonly SynchronizationContext _uiContext;
         private readonly object _stateLock = new();
@@ -77,95 +85,166 @@ namespace USBGuardian
         private int _activeFlag;
         private bool _hooksInstalled;
 
-        // ── Layer A: early combo block hook ─────────────────────────────────────────
-        private IntPtr _earlyHook = IntPtr.Zero;
-        private LowLevelKeyboardProc? _earlyProc;
-        private int _earlyBlockFlag;   // 1 = early block active
+        // ── Layer A: early block (keyboard + mouse hooks + BlockInput) ───────────────
+        // Uses a counter (not a bool flag) so simultaneous multi-device insertions
+        // don't prematurely release the block when one device is resolved.
+        private IntPtr _earlyKeyHook  = IntPtr.Zero;
+        private IntPtr _earlyMouseHook = IntPtr.Zero;
+        private LowLevelKeyboardProc? _earlyKeyProc;
+        private LowLevelMouseProc?    _earlyMouseProc;
+        private int _earlyBlockCounter;   // >0 = early block active
         private bool _earlyHookInstalled;
 
         private bool _disposed;
 
-        public bool IsActive => Volatile.Read(ref _activeFlag) == 1;
-        public bool EarlyBlocking => Volatile.Read(ref _earlyBlockFlag) == 1;
+        public bool IsActive     => Volatile.Read(ref _activeFlag)       == 1;
+        public bool EarlyBlocking => Volatile.Read(ref _earlyBlockCounter) > 0;
+
 
         public InputContainmentManager(SecurityEventLogger logger, SynchronizationContext uiContext)
         {
             _logger = logger;
             _uiContext = uiContext;
-            // Install the early hook on the UI thread so the message pump
+            // Install both early hooks on the UI thread so the message pump
             // receives hook callbacks. SetWindowsHookEx on a non-pump thread
             // means callbacks are silently dropped by Windows.
-            _uiContext.Post(_ => InstallEarlyHook(), null);
+            _uiContext.Post(_ => InstallEarlyHooks(), null);
         }
 
         // ── Layer A public API ───────────────────────────────────────────────────────
 
         /// <summary>
-        /// Called by OnPnpDeviceArrived at ~T+10ms.
-        /// Activates deadly-combo blocking before CM_Disable_DevNode completes.
+        /// Called by OnPnpDeviceArrived at ~T+10ms for each unknown HID device.
+        /// Uses a reference counter so multiple simultaneous insertions don't
+        /// prematurely release the block.
+        ///
+        /// STRATEGY: CM_Disable_DevNode CANNOT freeze HID keyboards/mice —
+        /// Windows returns CR_NOT_DISABLEABLE for protected input devices.
+        /// Instead we use:
+        ///   1. BlockInput(true)  — blocks ALL OS-level mouse+keyboard input
+        ///      instantly. No HID device can inject through this.
+        ///   2. WH_KEYBOARD_LL hook — secondary layer for any input not
+        ///      covered by BlockInput (injected synthetic input, etc.).
+        ///   3. WH_MOUSE_LL hook   — blocks all mouse button + movement
+        ///      messages at the hook chain level.
         /// </summary>
         public void EarlyComboBlock()
         {
-            Volatile.Write(ref _earlyBlockFlag, 1);
-            Debug.WriteLine("[InputContainment] Early combo block ACTIVE.");
-            _logger.LogInfo(0, "InputContainment", "Early combo block activated at PnP arrival.");
+            int newCount = Interlocked.Increment(ref _earlyBlockCounter);
+            if (newCount == 1)
+            {
+                // First device — engage BlockInput to freeze all HID input OS-wide.
+                // This is the ONLY reliable way to stop a HID mouse/keyboard because
+                // CM_Disable_DevNode returns CR_NOT_DISABLEABLE for those device classes.
+                BlockInput(true);
+                Debug.WriteLine("[InputContainment] BlockInput(true) — ALL HID input frozen.");
+                _logger.LogInfo(0, "InputContainment",
+                    "EarlyComboBlock: BlockInput engaged — all HID input suspended.");
+            }
+            else
+            {
+                Debug.WriteLine($"[InputContainment] EarlyComboBlock counter now {newCount} (already blocking).");
+            }
         }
 
         /// <summary>
-        /// Called by Deactivate() after dialog closes.
-        /// Restores all blocked combos for normal system use.
+        /// Called after a device decision is resolved.
+        /// Only releases BlockInput when ALL pending insertions have been decided.
         /// </summary>
         public void EarlyComboUnblock()
         {
-            Volatile.Write(ref _earlyBlockFlag, 0);
-            Debug.WriteLine("[InputContainment] Early combo block RELEASED.");
-            _logger.LogInfo(0, "InputContainment", "Early combo block released after decision.");
+            int newCount = Interlocked.Decrement(ref _earlyBlockCounter);
+            if (newCount <= 0)
+            {
+                // All pending devices resolved — release BlockInput.
+                Interlocked.Exchange(ref _earlyBlockCounter, 0); // clamp to 0
+                BlockInput(false);
+                Debug.WriteLine("[InputContainment] BlockInput(false) — HID input restored.");
+                _logger.LogInfo(0, "InputContainment",
+                    "EarlyComboUnblock: BlockInput released — normal input restored.");
+            }
+            else
+            {
+                Debug.WriteLine($"[InputContainment] EarlyComboUnblock counter now {newCount} (still blocking for other devices).");
+            }
         }
 
-        private void InstallEarlyHook()
+        /// <summary>
+        /// Emergency release — force BlockInput off regardless of counter.
+        /// Call this if the app is exiting or in an error state.
+        /// </summary>
+        public void ForceEarlyUnblock()
+        {
+            Interlocked.Exchange(ref _earlyBlockCounter, 0);
+            BlockInput(false);
+            Debug.WriteLine("[InputContainment] ForceEarlyUnblock — BlockInput force-released.");
+        }
+
+        private void InstallEarlyHooks()
         {
             lock (_stateLock)
             {
                 if (_earlyHookInstalled || _disposed) return;
 
-                _earlyProc = EarlyComboHookCallback;
-                _earlyHook = SetWindowsHookEx(WH_KEYBOARD_LL, _earlyProc, GetModuleHandle(null), 0);
+                _earlyKeyProc   = EarlyKeyboardHookCallback;
+                _earlyMouseProc = EarlyMouseHookCallback;
 
-                if (_earlyHook == IntPtr.Zero)
+                _earlyKeyHook  = SetWindowsHookEx(WH_KEYBOARD_LL, _earlyKeyProc,  GetModuleHandle(null), 0);
+                _earlyMouseHook = SetWindowsHookEx(WH_MOUSE_LL,    _earlyMouseProc, GetModuleHandle(null), 0);
+
+                if (_earlyKeyHook == IntPtr.Zero || _earlyMouseHook == IntPtr.Zero)
                 {
                     _logger.LogWarning(0, "InputContainment",
-                        $"Early combo hook install failed (Win32={Marshal.GetLastWin32Error()}). " +
-                        "Gap protection unavailable.");
-                    return;
+                        $"Early hook install failed (Win32={Marshal.GetLastWin32Error()}). " +
+                        "BlockInput is still the primary protection layer.");
+                    // Don't bail — BlockInput will still work as primary protection.
                 }
 
                 _earlyHookInstalled = true;
-                Debug.WriteLine("[InputContainment] Early combo hook installed at startup.");
+                Debug.WriteLine("[InputContainment] Early keyboard+mouse hooks installed at startup.");
             }
         }
 
         /// <summary>
-        /// The early hook callback — only runs filtering when _earlyBlockFlag == 1.
-        /// Near-zero overhead when inactive (single volatile read + pass-through).
+        /// Early keyboard hook — secondary layer. BlockInput is the primary.
+        /// This catches any synthetic injected input that BlockInput might miss.
         /// </summary>
-        private IntPtr EarlyComboHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        private IntPtr EarlyKeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode != HC_ACTION || !EarlyBlocking)
-                return CallNextHookEx(_earlyHook, nCode, wParam, lParam);
+                return CallNextHookEx(_earlyKeyHook, nCode, wParam, lParam);
 
-            // Always let our own process through (dialog buttons etc).
+            // Allow input to our own process windows (dialog buttons).
             IntPtr fg = GetForegroundWindow();
             if (IsOwnedByCurrentProcess(fg))
-                return CallNextHookEx(_earlyHook, nCode, wParam, lParam);
+                return CallNextHookEx(_earlyKeyHook, nCode, wParam, lParam);
 
+            // Block ALL external keystrokes during the early window.
             var key = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-            if (IsDeadlyCombo(key))
-            {
-                Debug.WriteLine($"[EarlyBlock] Blocked deadly combo VK=0x{key.vkCode:X2}");
-                return (IntPtr)1;
-            }
+            Debug.WriteLine($"[EarlyBlock] Keyboard swallowed VK=0x{key.vkCode:X2}");
+            return (IntPtr)1;
+        }
 
-            return CallNextHookEx(_earlyHook, nCode, wParam, lParam);
+        /// <summary>
+        /// Early mouse hook — blocks all mouse movement and clicks during EarlyComboBlock.
+        /// This prevents a composite Ducky (keyboard+mouse) from moving the cursor
+        /// or clicking on UI elements while the decision dialog is loading.
+        /// </summary>
+        private IntPtr EarlyMouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode != HC_ACTION || !EarlyBlocking)
+                return CallNextHookEx(_earlyMouseHook, nCode, wParam, lParam);
+
+            // Allow mouse input to our own process (so dialog buttons are clickable).
+            var mouse = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+            IntPtr hwndUnderCursor = WindowFromPoint(mouse.pt);
+            if (IsOwnedByCurrentProcess(hwndUnderCursor))
+                return CallNextHookEx(_earlyMouseHook, nCode, wParam, lParam);
+
+            int msg = unchecked((int)wParam.ToInt64());
+            // Block all movement and clicks from non-Guardian windows.
+            Debug.WriteLine($"[EarlyBlock] Mouse swallowed msg=0x{msg:X4}");
+            return (IntPtr)1;
         }
 
         /// <summary>
@@ -443,11 +522,14 @@ namespace USBGuardian
                 if (_disposed) return;
                 _disposed = true;
                 Volatile.Write(ref _activeFlag, 0);
-                Volatile.Write(ref _earlyBlockFlag, 0);
+                Interlocked.Exchange(ref _earlyBlockCounter, 0);
+                // Always release BlockInput on dispose — never leave the system locked.
+                BlockInput(false);
 
-                if (_keyboardHook != IntPtr.Zero) { UnhookWindowsHookEx(_keyboardHook); _keyboardHook = IntPtr.Zero; }
-                if (_mouseHook != IntPtr.Zero) { UnhookWindowsHookEx(_mouseHook); _mouseHook = IntPtr.Zero; }
-                if (_earlyHook != IntPtr.Zero) { UnhookWindowsHookEx(_earlyHook); _earlyHook = IntPtr.Zero; }
+                if (_keyboardHook  != IntPtr.Zero) { UnhookWindowsHookEx(_keyboardHook);   _keyboardHook  = IntPtr.Zero; }
+                if (_mouseHook     != IntPtr.Zero) { UnhookWindowsHookEx(_mouseHook);      _mouseHook     = IntPtr.Zero; }
+                if (_earlyKeyHook  != IntPtr.Zero) { UnhookWindowsHookEx(_earlyKeyHook);   _earlyKeyHook  = IntPtr.Zero; }
+                if (_earlyMouseHook != IntPtr.Zero) { UnhookWindowsHookEx(_earlyMouseHook); _earlyMouseHook = IntPtr.Zero; }
             }
         }
 
@@ -540,5 +622,17 @@ namespace USBGuardian
 
         [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+        /// <summary>
+        /// Blocks all keyboard and mouse input events from reaching the message queue.
+        /// BlockInput(true)  = all HID input frozen system-wide (no device can bypass this).
+        /// BlockInput(false) = normal input restored.
+        /// Requires UIPI privilege — runs fine when USB Guardian has focus or is elevated.
+        /// IMPORTANT: Always call BlockInput(false) before the process exits, or the
+        ///            system will be stuck with no mouse/keyboard until reboot.
+        /// </summary>
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool BlockInput([MarshalAs(UnmanagedType.Bool)] bool fBlockIt);
     }
 }

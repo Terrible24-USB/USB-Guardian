@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <assemblyIdentity version="1.0.0.0" name="USB-Guardian.app"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
+    <security>
+      <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
+        <!-- requireAdministrator: Required for:
+             1. BlockInput() API — blocks all HID input during device decision window.
+                Without elevation, BlockInput() is a no-op on Vista+ (UIPI restriction).
+             2. CM_Disable_DevNode / CM_Enable_DevNode — PnP operations require admin.
+             3. SetupDi device class operations — require admin for write access.
+             4. Registry writes to HKLM\SYSTEM\CurrentControlSet\Enum — require admin. -->
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>
