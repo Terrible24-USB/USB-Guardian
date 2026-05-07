@@ -30,6 +30,7 @@ namespace USBGuardian
 
         public DeviceEvaluationResult EvaluateDevice(DeviceFingerprint fingerprint)
         {
+            _keystrokeMonitor.LastInsertedUsbDevice = fingerprint;
             var result = new DeviceEvaluationResult { DeviceFingerprint = fingerprint };
             string vidPid = $"{fingerprint.Vid}:{fingerprint.Pid}";
 
@@ -77,7 +78,17 @@ namespace USBGuardian
 
         public void StartKeystrokeMonitoring(string vidPid) => _keystrokeMonitor.StartMonitoring(vidPid);
 
-        public KeystrokeThreatResult EvaluateKeystrokeThreat(string vidPid) => _keystrokeMonitor.AnalyzeRealtime(vidPid);
+        public KeystrokeThreatResult EvaluateKeystrokeThreat(string vidPid, bool stop = false, bool isText = false, string text = "")
+        {
+            if (stop) return _keystrokeMonitor.StopMonitoring(vidPid);
+            
+            if (isText)
+                _keystrokeMonitor.RecordText(vidPid, text);
+            else
+                _keystrokeMonitor.RecordKeystroke(vidPid, DateTime.UtcNow);
+
+            return _keystrokeMonitor.AnalyzeRealtime(vidPid);
+        }
 
         public bool IsWhitelisted(DeviceFingerprint fingerprint) => _whitelistManager.IsWhitelisted(fingerprint);
 

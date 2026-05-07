@@ -126,6 +126,8 @@ namespace USBGuardian
         private DiskArrivalGuard _diskArrivalGuard;
         private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool>
             _pnpEarlyApprovedInstances = new(StringComparer.OrdinalIgnoreCase);
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime>
+            _recentlyAllowedInstances = new(StringComparer.OrdinalIgnoreCase);
 
         public USBMessageWindow()
         {
@@ -148,7 +150,7 @@ namespace USBGuardian
             deviceIdentifier.HistoryManager = historyManager;
 
             // Initialize the redesigned security engine core
-            guardianCore = new UsbGuardianCore();
+            guardianCore = new UsbGuardianCore(_uiContext);
             _ = guardianCore.InitializeAsync();
             intelligentUsbBlocker = guardianCore.IntelligentUsbBlocker;
 
@@ -386,16 +388,16 @@ namespace USBGuardian
 
                         if (!string.IsNullOrEmpty(vid) && !string.IsNullOrEmpty(pid))
                         {
-                            // Engage full containment hooks IMMEDIATELY on device arrival.
-                            // This installs WH_KEYBOARD_LL + WH_MOUSE_LL hooks that:
-                            //   ✅ Block all keyboard/mouse input to non-Guardian windows
-                            //   ✅ Allow your internal keyboard/mouse on the Guardian dialog
-                            //   ✅ Do NOT touch BlockInput — dialog buttons stay clickable
-                            // DO NOT use BlockInput(true) here — it freezes ALL input
-                            // including internal keyboard/mouse AND the Allow/Block dialog,
-                            // causing the 20-second timeout to fire silently every time.
-                            _inputContainment.Activate($"USB arrival {vid}:{pid}");
-
+                            // NOTE: Do NOT call _inputContainment.Activate() here.
+                            // Activating containment on every USB arrival (including whitelisted
+                            // storage devices) causes the keyboard/mouse to get permanently stuck
+                            // in isolation mode when the Deactivate call count does not match
+                            // the Activate call count (e.g. whitelisted device → returns early
+                            // in ProcessUsbDevice without going through ContainmentController).
+                            //
+                            // Full containment is ONLY entered via ContainmentController.Enter()
+                            // inside ProcessUsbDevice, ONLY when an actual security dialog must
+                            // be shown and the device could not be hardware-frozen first.
                             var timer = Stopwatch.StartNew();
                             string capturedVid = vid;
                             string capturedPid = pid;
@@ -409,7 +411,9 @@ namespace USBGuardian
                                 }
                                 catch (Exception ex)
                                 {
-                                    _inputContainment.Deactivate($"USB arrival error {vid}:{pid}");
+                                    // Safety net: if ProcessUsbDevice throws before the
+                                    // ContainmentController scope can Dispose, force-release.
+                                    _inputContainment.ForceEarlyUnblock();
                                     Debug.WriteLine($"[WndProc] ProcessUsbDevice thread error: {ex.Message}");
                                 }
                             });
@@ -583,6 +587,25 @@ namespace USBGuardian
                 }
                 // ── END EARLY WHITELIST CHECK ─────────────────────────────────────
 
+                // ── RECENTLY ALLOWED GUARD ─────────────────────────────────────────
+                // If we explicitly re-enabled this device in the last 15 seconds (e.g. user
+                // clicked "Allow"), Windows will fire a new PnP arrival event. We MUST NOT
+                // freeze it again, otherwise we trap the user in an infinite prompt loop.
+                if (_recentlyAllowedInstances.TryGetValue(instanceId, out DateTime allowedTime))
+                {
+                    if ((DateTime.UtcNow - allowedTime).TotalSeconds < 15)
+                    {
+                        Debug.WriteLine($"[PnpGuard] Bypassing freeze for recently allowed device: {instanceId}");
+                        return;
+                    }
+                    else
+                    {
+                        // Clean up old entries
+                        _recentlyAllowedInstances.TryRemove(instanceId, out _);
+                    }
+                }
+                // ── END RECENTLY ALLOWED GUARD ─────────────────────────────────────
+
                 // Default path: freeze everything. Let ProcessUsbDevice decide via
                 // full fingerprint + dialog.
                 //
@@ -752,6 +775,24 @@ namespace USBGuardian
                 if (pnpAlreadyFrozen)
                     LogDecisionPipeline("PNP_FROZEN", decisionKey, null, "Device was pre-frozen by PnP fast-path");
 
+                // ── RECENTLY ALLOWED ECHO GUARD ───────────────────────────────────
+                // When we successfully hardware-freeze a device and the user clicks Allow,
+                // we call CM_Enable_DevNode. This causes Windows to see a "new" device
+                // and fire another WM_DEVICECHANGE. We MUST ignore this echo, otherwise
+                // "Allow Once" triggers an infinite loop of prompts.
+                if (!string.IsNullOrWhiteSpace(fullPnpInstanceId) && 
+                    _recentlyAllowedInstances.TryGetValue(fullPnpInstanceId, out DateTime allowedTime))
+                {
+                    if ((DateTime.UtcNow - allowedTime).TotalSeconds < 15)
+                    {
+                        LogDecisionPipeline("RECENTLY_ALLOWED_ECHO", decisionKey, null,
+                            "Skipping pipeline — this is an echo from our own CM_Enable_DevNode call.");
+                        Debug.WriteLine($"[ProcessUsbDevice] Ignoring echo for recently allowed device: {fullPnpInstanceId}");
+                        return;
+                    }
+                }
+                // ── END RECENTLY ALLOWED ECHO GUARD ───────────────────────────────
+
                 // EARLY WHITELIST FAST-PATH ────────────────────────────────────────
                 // If OnPnpDeviceArrived matched this device against the early whitelist
                 // at T+10ms, skip the entire decision pipeline — device already loaded
@@ -869,10 +910,11 @@ namespace USBGuardian
                     }
 
                     // Re-enable the device node if the PnP fast-path had frozen it.
-                    if (pnpAlreadyFrozen && !string.IsNullOrWhiteSpace(instanceId))
+                    if (pnpAlreadyFrozen && !string.IsNullOrWhiteSpace(fullPnpInstanceId))
                     {
-                        PnpDeviceGuard.EnableDevNodeAndChildren(instanceId);
-                        Debug.WriteLine($"[PnpGuard] Re-enabled whitelisted device: {instanceId}");
+                        _recentlyAllowedInstances[fullPnpInstanceId] = DateTime.UtcNow;
+                        PnpDeviceGuard.EnableDevNodeAndChildren(fullPnpInstanceId);
+                        Debug.WriteLine($"[PnpGuard] Re-enabled whitelisted device: {fullPnpInstanceId}");
                     }
 
                     Debug.WriteLine("✅ DEVICE ALLOWED - Found in whitelist");
@@ -887,10 +929,11 @@ namespace USBGuardian
                         "USB Device Allowed",
                         $"{currentDevice.Description ?? "Unknown Device"} has been allowed.");
 
-                    // Release full containment if WndProc activated it.
-                    // The containment scope (which normally calls Deactivate)
-                    // is not entered on this early-return path, so we must release explicitly.
-                    _inputContainment.Deactivate("Matched existing whitelist entry");
+                    // Containment is NOT active on the whitelist fast-return path.
+                    // WndProc no longer calls Activate() on every arrival, so there
+                    // is nothing to release here. Calling Deactivate() here would
+                    // corrupt the EarlyBlockCounter reference count.
+                    Debug.WriteLine("[Containment] Whitelist fast-path — no containment to release.");
 
                     // Release Layer 2 disk guard exclusive handle so it mounts immediately.
                     _diskArrivalGuard?.ReleaseHeldHandleByInstanceId(instanceId);
@@ -905,8 +948,9 @@ namespace USBGuardian
                         "USB Device Allowed",
                         $"{currentDevice.Description ?? "Unknown Device"} has been allowed by security whitelist.");
 
-                    // Release full containment — containment scope not entered on this path.
-                    _inputContainment.Deactivate("Matched security whitelist");
+                    // Containment is NOT active on the security-engine whitelist path.
+                    // WndProc no longer calls Activate() on every arrival.
+                    Debug.WriteLine("[Containment] Security engine whitelist path — no containment to release.");
 
                     // Release Layer 2 disk guard exclusive handle.
                     _diskArrivalGuard?.ReleaseHeldHandleByInstanceId(instanceId);
@@ -970,19 +1014,23 @@ namespace USBGuardian
                 if (userDecision == DeviceDecisionAction.AllowOnce ||
                     userDecision == DeviceDecisionAction.AllowAndWhitelist)
                 {
-                    // Re-enable device node if the PnP fast-path had frozen it.
-                    if (pnpAlreadyFrozen && !string.IsNullOrWhiteSpace(instanceId))
-                    {
-                        PnpDeviceGuard.EnableDevNodeAndChildren(instanceId);
-                        Debug.WriteLine($"[PnpGuard] Re-enabled allowed device: {instanceId}");
-                    }
-
                     if (temporaryDecisionBlock != null)
                     {
+                        // 1. UnblockDevice FIRST: This clears the ConfigFlags in the registry.
+                        // If we don't clear them first, the subsequent EnableDevNode call
+                        // will fail because the PnP Manager will see ConfigFlags=1 and refuse to start the device.
                         UnblockResult tempUnblockResult = unblockManager.UnblockDevice(temporaryDecisionBlock);
                         foreach (string msg in tempUnblockResult.Messages)
                             Debug.WriteLine($"[TempDecisionUnblock] {msg}");
                         RemoveTemporaryDecisionBlock(decisionKey);
+                    }
+
+                    // 2. Re-enable device node if the PnP fast-path had frozen it.
+                    if (pnpAlreadyFrozen && !string.IsNullOrWhiteSpace(fullPnpInstanceId))
+                    {
+                        _recentlyAllowedInstances[fullPnpInstanceId] = DateTime.UtcNow;
+                        PnpDeviceGuard.EnableDevNodeAndChildren(fullPnpInstanceId);
+                        Debug.WriteLine($"[PnpGuard] Re-enabled allowed device: {fullPnpInstanceId}");
                     }
 
                     // Release Layer 2 disk guard exclusive handle before re-enumeration.
@@ -1066,19 +1114,19 @@ namespace USBGuardian
                     ? "Blocked by user decision"
                     : evalResult.BlockReason;
 
-                // ── IMMEDIATE HID FREEZE ON BLOCK ─────────────────────────────────
+                // ── IMMEDIATE FREEZE ON BLOCK ─────────────────────────────────────
                 // Uses fullPnpInstanceId (USB\VID_xxxx&PID_xxxx\serial) not bare instanceId.
                 // CM_Locate_DevNodeW requires the full form — bare serial gives CR=0x1E.
                 if (!string.IsNullOrWhiteSpace(fullPnpInstanceId))
                 {
-                    bool refreeze = PnpDeviceGuard.DisableDevNodeWithParent(fullPnpInstanceId);
+                    bool refreeze = PnpDeviceGuard.DisableDevNodeAndChildren(fullPnpInstanceId);
                     Debug.WriteLine(refreeze
                         ? $"[PnpGuard] Device re-frozen on Block decision: {fullPnpInstanceId}"
                         : $"[PnpGuard] Re-freeze on Block decision failed: {fullPnpInstanceId}");
                     guardianCore?.EventLogger?.LogWarning(0, "PnpGuard",
                         $"Device disabled on user Block: {fullPnpInstanceId}");
                 }
-                // ── END IMMEDIATE HID FREEZE ──────────────────────────────────────
+                // ── END IMMEDIATE FREEZE ──────────────────────────────────────────
 
                 if (evalResult.ShouldBlock)
                 {

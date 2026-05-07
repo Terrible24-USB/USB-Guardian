@@ -19,7 +19,7 @@ namespace USBGuardian
     public class SecurityEvent
     {
         public Guid EventId { get; set; } = Guid.NewGuid();
-        public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+        public DateTime Timestamp { get; set; } = DateTime.Now;
         public SecuritySeverity Severity { get; set; }
         public int Layer { get; set; }
         public string EventType { get; set; } = string.Empty;

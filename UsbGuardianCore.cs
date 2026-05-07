@@ -28,12 +28,13 @@ namespace USBGuardian
         private readonly DeviceInformationCollector _deviceInformationCollector;
         private readonly DeviceWhitelist _deviceWhitelist;
         private readonly IntelligentUsbBlocker _intelligentUsbBlocker;
+        private readonly GlobalKeystrokeTelemetry _globalTelemetry;
 
         public SecurityEventLogger EventLogger => _eventLogger;
         public UsbBlockingManager BlockingManager => _blockingManager;
         public IntelligentUsbBlocker IntelligentUsbBlocker => _intelligentUsbBlocker;
 
-        public UsbGuardianCore()
+        public UsbGuardianCore(SynchronizationContext uiContext)
         {
             _eventLogger = new SecurityEventLogger();
             _blockingManager = new UsbBlockingManager(_eventLogger);
@@ -41,6 +42,7 @@ namespace USBGuardian
             _deviceInformationCollector = new DeviceInformationCollector();
             _deviceWhitelist = new DeviceWhitelist();
             _intelligentUsbBlocker = new IntelligentUsbBlocker(_eventLogger, _deviceWhitelist, _deviceInformationCollector);
+            _globalTelemetry = new GlobalKeystrokeTelemetry(_securityEngine, _eventLogger, uiContext);
         }
 
         public async Task InitializeAsync()
@@ -51,6 +53,7 @@ namespace USBGuardian
                 {
                     _eventLogger.LogInfo(0, "Startup", "USB Guardian Core initializing");
                     _eventLogger.LogInfo(0, "Startup", "USB Guardian Core initialized — 5-layer aggressive defense active");
+                    _globalTelemetry.Start();
                 }
                 catch (Exception ex)
                 {

@@ -258,12 +258,28 @@ namespace USBGuardian
         /// <summary>
         /// Attempts to disable the device node itself, and then recursively disables all children.
         /// This is the most aggressive and reliable method to freeze a device.
+        /// Includes a fast-retry loop to resolve race conditions where the PnP Manager
+        /// rejects the disable request because the device state is still transitioning at T+10ms.
         /// </summary>
-        public static bool DisableDevNodeAndChildren(string deviceInstanceId)
+        public static bool DisableDevNodeAndChildren(string deviceInstanceId, int maxRetries = 15, int retryDelayMs = 10)
         {
-            bool selfDisabled = DisableDevNode(deviceInstanceId);
-            bool childrenDisabled = DisableDevNodeChildren(deviceInstanceId);
-            return selfDisabled || childrenDisabled;
+            for (int i = 0; i < maxRetries; i++)
+            {
+                bool selfDisabled = DisableDevNode(deviceInstanceId);
+                bool childrenDisabled = DisableDevNodeChildren(deviceInstanceId);
+                
+                if (selfDisabled || childrenDisabled)
+                {
+                    if (i > 0)
+                        Debug.WriteLine($"[PnpDeviceGuard] DisableDevNodeAndChildren succeeded after {i} retries for {deviceInstanceId}");
+                    return true;
+                }
+                
+                System.Threading.Thread.Sleep(retryDelayMs);
+            }
+            
+            Debug.WriteLine($"[PnpDeviceGuard] DisableDevNodeAndChildren failed completely after {maxRetries} retries for {deviceInstanceId}");
+            return false;
         }
 
         private static bool DisableChildTree(uint parentInst)

@@ -42,6 +42,12 @@ namespace USBGuardian
             "net user", "reg add"
         };
 
+        // Sliding window: only the most recent N timestamps are kept.
+        // This ensures KPS always reflects CURRENT burst speed, not lifetime average.
+        // A Rubber Ducky fires ~200 keystrokes in ~1.5 seconds → KPS ≈ 130 → Critical.
+        // Normal humans type 5-8 KPS → window is never filled fast enough to trigger.
+        private const int MaxTimestamps = 200;
+
         public KeystrokeBehaviorAnalyzer(SecurityEventLogger logger)
         {
             _logger = logger;
@@ -103,6 +109,13 @@ namespace USBGuardian
             {
                 if (!_sessions.TryGetValue(vidPid, out var session)) return;
                 session.KeystrokeTimestamps.Add(timestamp);
+
+                // Enforce sliding window — drop oldest timestamps beyond the cap.
+                // This means KPS is always computed over the most recent MaxTimestamps
+                // events, not the entire session lifetime, so burst attacks are always
+                // visible even in a long-running session.
+                while (session.KeystrokeTimestamps.Count > MaxTimestamps)
+                    session.KeystrokeTimestamps.RemoveAt(0);
             }
         }
 
@@ -171,11 +184,15 @@ namespace USBGuardian
                 result.RiskScore = Math.Min(100, score);
 
                 if (result.IsRobot)
-                    _logger.LogAttack(3, "RobotKeystroke", $"Robot-like keystrokes from {vidPid}: {result.KeysPerSecond:F1} kps, {result.TimingVariancePercent:F1}% variance, risk={result.RiskScore}", vidPid);
+                    _logger.LogAttack(3, "RobotKeystroke",
+                        $"Robot-like keystrokes from {vidPid}: {result.KeysPerSecond:F1} kps, " +
+                        $"{result.TimingVariancePercent:F1}% variance, risk={result.RiskScore}", vidPid);
                 else if (result.SuspiciousCommandsDetected.Count > 0)
-                    _logger.LogWarning(3, "SuspiciousInput", $"Suspicious commands from {vidPid}: {string.Join(", ", result.SuspiciousCommandsDetected)}", vidPid);
-                else
-                    _logger.LogInfo(3, "BehaviorAnalysis", $"Keystroke analysis for {vidPid}: {result.KeysPerSecond:F1} kps, risk={result.RiskScore}", vidPid);
+                    _logger.LogWarning(3, "SuspiciousInput",
+                        $"Suspicious commands from {vidPid}: {string.Join(", ", result.SuspiciousCommandsDetected)}", vidPid);
+                // NOTE: No Info log for clean keystrokes — that would generate thousands of
+                // entries per minute, flood the 1,000-event cap, and push out real USB events.
+                // Threat detections are always written; clean typing is silently discarded.
             }
             catch (Exception ex)
             {

@@ -20,6 +20,15 @@ namespace USBGuardian
         private readonly KeystrokeBehaviorAnalyzer _analyzer;
         private readonly RubberDuckyPatternDetector _patternDetector;
 
+        // Per-session throttle: only run the full analysis once per second max.
+        // This prevents hammering the log file with thousands of Info entries.
+        private readonly Dictionary<string, DateTime> _lastAnalysisTime = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly TimeSpan AnalysisInterval = TimeSpan.FromSeconds(1);
+
+        // Tracks the last USB device evaluated by the security engine
+        // so we can correlate keyboard macro attacks to the most recently inserted device.
+        public DeviceFingerprint? LastInsertedUsbDevice { get; set; }
+
         public RealTimeKeystrokeMonitor(SecurityEventLogger logger)
         {
             _logger = logger;
@@ -35,6 +44,15 @@ namespace USBGuardian
 
         public KeystrokeThreatResult AnalyzeRealtime(string vidPid)
         {
+            // Throttle: skip analysis if we ran it less than 1 second ago for this session.
+            DateTime now = DateTime.UtcNow;
+            if (_lastAnalysisTime.TryGetValue(vidPid, out DateTime last) &&
+                (now - last) < AnalysisInterval)
+            {
+                return new KeystrokeThreatResult(); // blank — not a threat, not logged
+            }
+            _lastAnalysisTime[vidPid] = now;
+
             var behavior = _analyzer.AnalyzeSession(vidPid);
             var pattern = _patternDetector.AnalyzeCommands(behavior.SuspiciousCommandsDetected);
 
@@ -53,14 +71,14 @@ namespace USBGuardian
                 result.IsThreat = true;
                 result.ShouldIsolate = true;
                 result.ThreatLevel = ThreatLevel.Critical;
-                result.Reason = $">100 keys per second detected ({behavior.KeysPerSecond:F1})";
+                result.Reason = $">100 keys per second detected ({behavior.KeysPerSecond:F1} kps)";
             }
             else if (behavior.KeysPerSecond >= 20 && behavior.TimingVariancePercent < 10)
             {
                 result.IsThreat = true;
                 result.ShouldIsolate = true;
                 result.ThreatLevel = ThreatLevel.High;
-                result.Reason = $"Uniform high-speed input ({behavior.KeysPerSecond:F1} keys per second, variance {behavior.TimingVariancePercent:F1}%)";
+                result.Reason = $"Uniform high-speed input ({behavior.KeysPerSecond:F1} kps, variance {behavior.TimingVariancePercent:F1}%)";
             }
             else if (pattern.IsThreat)
             {
@@ -71,7 +89,13 @@ namespace USBGuardian
             }
 
             if (result.ShouldIsolate)
-                _logger.LogAttack(3, "RealTimeKeystrokeThreat", result.Reason, vidPid);
+            {
+                string priorUsbInfo = LastInsertedUsbDevice != null 
+                    ? $" | Prior USB: {LastInsertedUsbDevice.Vid}:{LastInsertedUsbDevice.Pid} ({LastInsertedUsbDevice.Description ?? "Unknown Device"})" 
+                    : "";
+                    
+                _logger.LogAttack(3, "RealTimeKeystrokeThreat", result.Reason + priorUsbInfo, vidPid);
+            }
 
             return result;
         }
